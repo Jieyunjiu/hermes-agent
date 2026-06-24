@@ -109,6 +109,17 @@ def test_follows_compression_tip_when_parent_retains_messages(db):
     assert db.resolve_resume_session_id("root") == "cont"
 
 
+def test_compression_child_inherits_parent_owner_key(db):
+    """compression 子 session 未显式传 owner_key 时，必须继承父 session。"""
+    owner = "wecom:corp:app:alice"
+    db.create_session("root", source="wecom", owner_key=owner)
+    db.end_session("root", "compression")
+
+    db.create_session("cont", source="wecom", parent_session_id="root")
+
+    assert db.get_session("cont")["owner_key"] == owner
+
+
 def test_compression_tip_not_confused_with_delegation_child(db):
     # A delegation/branch child is created while the parent is still live (the
     # parent is NOT ended with end_reason='compression'), so resuming the

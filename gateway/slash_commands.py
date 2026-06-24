@@ -2376,6 +2376,7 @@ class GatewaySlashCommandsMixin:
         new setting takes effect on the next message.
         """
         from gateway.run import _hermes_home
+        from gateway.multi_tenant import scoped_owner_key
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
@@ -2396,14 +2397,16 @@ class GatewaySlashCommandsMixin:
             # New setting must take effect next message → drop cached agent.
             self._evict_cached_agent(session_key)
 
-        # Apply approved writes against a fresh on-disk store (the gateway has
-        # no long-lived agent; the store persists to the same MEMORY/USER.md).
-        # load_on_disk_store() honors the user's configured char limits.
-        store = load_on_disk_store()
+        owner_key = getattr(event.source, "owner_key", "") or ""
+        with scoped_owner_key(owner_key):
+            # Apply approved writes against a fresh on-disk store (the gateway has
+            # no long-lived agent; the store persists to the same MEMORY/USER.md).
+            # 多租户下 load_on_disk_store() 会读取 owner 隔离后的 memory 目录。
+            store = load_on_disk_store()
 
-        out = handle_pending_subcommand(
-            wa.MEMORY, args, memory_store=store, set_mode_fn=_set_approval,
-        )
+            out = handle_pending_subcommand(
+                wa.MEMORY, args, memory_store=store, set_mode_fn=_set_approval,
+            )
         if out is None:
             out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
                    "reject <id>, approval <on|off>.")
@@ -2426,6 +2429,7 @@ class GatewaySlashCommandsMixin:
         ``hermes skills diff <name>`` that diffs a bundled skill vs stock.)
         """
         from gateway.run import _hermes_home
+        from gateway.multi_tenant import scoped_owner_key
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
 
@@ -2433,13 +2437,6 @@ class GatewaySlashCommandsMixin:
         args = raw_args.split() if raw_args else []
         session_key = self._session_key_for_source(event.source)
         config_path = _hermes_home / "config.yaml"
-
-        gate_on = wa.write_approval_enabled(wa.SKILLS)
-        wants_toggle = bool(args) and args[0].lower() in {"approval", "mode"}
-        if not gate_on and not wants_toggle and wa.pending_count(wa.SKILLS) == 0:
-            return ("Skill write approval is off (skills.write_approval). "
-                    "Enable it with /skills approval on, then review staged "
-                    "writes here with /skills pending.")
 
         def _set_approval(enabled: bool):
             import yaml
@@ -2452,9 +2449,18 @@ class GatewaySlashCommandsMixin:
             # New setting must take effect next message → drop cached agent.
             self._evict_cached_agent(session_key)
 
-        out = handle_pending_subcommand(
-            wa.SKILLS, args, set_mode_fn=_set_approval,
-        )
+        owner_key = getattr(event.source, "owner_key", "") or ""
+        with scoped_owner_key(owner_key):
+            gate_on = wa.write_approval_enabled(wa.SKILLS)
+            wants_toggle = bool(args) and args[0].lower() in {"approval", "mode"}
+            if not gate_on and not wants_toggle and wa.pending_count(wa.SKILLS) == 0:
+                return ("Skill write approval is off (skills.write_approval). "
+                        "Enable it with /skills approval on, then review staged "
+                        "writes here with /skills pending.")
+
+            out = handle_pending_subcommand(
+                wa.SKILLS, args, set_mode_fn=_set_approval,
+            )
         if out is None:
             return ("Unknown /skills subcommand on this platform. Use: pending, "
                     "approve <id>, reject <id>, diff <id>, approval <on|off>. "
@@ -3047,6 +3053,11 @@ class GatewaySlashCommandsMixin:
 
         source = event.source
         session_key = self._session_key_for_source(source)
+        # 必改 9：提取当前 owner_key，用于 /resume 全链路 owner 校验。
+        # source 已携带 owner_key（WeCom adapter 构造时生成）。非多租户时为空，
+        # assert_session_owner 会放行——保持向后兼容。
+        from gateway.multi_tenant import assert_session_owner
+        _owner_key = getattr(source, "owner_key", None) or ""
         raw_args = event.get_command_args().strip()
         try:
             parts = shlex.split(raw_args)
@@ -3068,7 +3079,11 @@ class GatewaySlashCommandsMixin:
 
         def _list_titled_sessions() -> list[dict]:
             user_source = source.platform.value if source.platform else None
-            sessions = self._session_db.list_sessions_rich(source=user_source, limit=10)
+            # 必改 9：多租户模式下只列出当前 owner 的 titled session，
+            # 防止 /resume 列表泄露他人会话标题（防枚举）。
+            sessions = self._session_db.list_sessions_rich(
+                source=user_source, limit=10, owner_key=_owner_key or None,
+            )
             return [s for s in sessions if s.get("title")][:10]
 
         if not name:
@@ -3127,9 +3142,18 @@ class GatewaySlashCommandsMixin:
             # works in the gateway, not just `/resume <title>`).
             session = self._session_db.get_session(name)
             if session:
+                # 必改 9：id 路径——校验目标 session 是否属于当前 owner。
+                # 不属于则当作 not found（防枚举，不泄漏存在性）。
+                _err = assert_session_owner(self._session_db, session["id"], _owner_key)
+                if _err:
+                    return t("gateway.resume.not_found", name=name)
                 target_id = session["id"]
             else:
-                target_id = self._session_db.resolve_session_by_title(name)
+                # 必改 9：title 路径——resolve_session_by_title 已支持 owner 过滤，
+                # 跨 owner 的 title 解析直接返回 None。
+                target_id = self._session_db.resolve_session_by_title(
+                    name, owner_key=_owner_key or None,
+                )
         if not target_id:
             return t("gateway.resume.not_found", name=name)
         # Compression creates child continuations that hold the live transcript.
@@ -3138,6 +3162,12 @@ class GatewaySlashCommandsMixin:
             target_id = self._session_db.resolve_resume_session_id(target_id)
         except Exception as e:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
+
+        # 必改 9：compression continuation 链尾最终目标也要校验 owner。
+        # continuation 可能把目标指向另一个 owner 的子 session，必须拦截。
+        _err = assert_session_owner(self._session_db, target_id, _owner_key)
+        if _err:
+            return t("gateway.resume.not_found", name=name)
 
         if source.platform == Platform.MATRIX:
             target_origin = self._gateway_session_origin_for_id(target_id)
@@ -3159,7 +3189,10 @@ class GatewaySlashCommandsMixin:
         self._release_running_agent_state(session_key)
 
         # Switch the session entry to point at the old session
-        new_entry = self.session_store.switch_session(session_key, target_id)
+        # 必改 9：传 owner_key 做 defense-in-depth 校验。
+        new_entry = self.session_store.switch_session(
+            session_key, target_id, owner_key=_owner_key or None,
+        )
         if not new_entry:
             return t("gateway.resume.switch_failed")
         self._clear_session_boundary_security_state(session_key)
@@ -3284,6 +3317,9 @@ class GatewaySlashCommandsMixin:
         # list_sessions_rich() keeps the branch visible in /resume and
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        # 必改 4：显式传 owner_key（子 session 继承父 owner）。即使这里漏传，
+        # _insert_session_row 也有 parent 继承兜底。
+        _branch_owner = getattr(source, "owner_key", None) or None
         try:
             self._session_db.create_session(
                 session_id=new_session_id,
@@ -3291,6 +3327,7 @@ class GatewaySlashCommandsMixin:
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
                 model_config={"_branched_from": parent_session_id},
                 parent_session_id=parent_session_id,
+                owner_key=_branch_owner,
             )
         except Exception as e:
             logger.error("Failed to create branch session: %s", e)
@@ -3601,6 +3638,16 @@ class GatewaySlashCommandsMixin:
         Users can also skip the confirm by flipping the config key directly.
         """
         source = event.source
+        try:
+            from gateway.multi_tenant import (
+                dynamic_reload_denied_message,
+                multi_tenant_enabled,
+            )
+
+            if multi_tenant_enabled() and getattr(source, "owner_key", None):
+                return dynamic_reload_denied_message()
+        except Exception:
+            pass
         session_key = self._session_key_for_source(source)
 
         # Read the gate fresh from disk so a prior "always" click takes
@@ -3662,6 +3709,16 @@ class GatewaySlashCommandsMixin:
         is written to the session transcript out-of-band, so message
         alternation is preserved.
         """
+        try:
+            from gateway.multi_tenant import (
+                dynamic_reload_denied_message,
+                multi_tenant_enabled,
+            )
+
+            if multi_tenant_enabled() and getattr(event.source, "owner_key", None):
+                return dynamic_reload_denied_message()
+        except Exception:
+            pass
         loop = asyncio.get_running_loop()
         try:
             from agent.skill_commands import reload_skills

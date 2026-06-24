@@ -65,8 +65,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _looks_like_image,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    validate_inbound_media_size,
 )
 from utils import env_float
 
@@ -140,6 +142,14 @@ def _entry_matches(entries: List[str], target: str) -> bool:
     return False
 
 
+def _safe_upload_component(value: str, fallback: str) -> str:
+    """Return a path-safe filename/segment for owner-workspace uploads."""
+    name = Path(str(value or "")).name.replace("\x00", "").strip()
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    name = name.strip("._")
+    return name or fallback
+
+
 class WeComAdapter(BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
@@ -155,6 +165,11 @@ class WeComAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self._bot_id = str(extra.get("bot_id") or os.getenv("WECOM_BOT_ID", "")).strip()
         self._secret = str(extra.get("secret") or os.getenv("WECOM_SECRET", "")).strip()
+        # 必改 2：WS 智能机器人模式下，整个 bot 绑定单个企业（corp）。
+        # 多租户隔离需要 corp_id 来构造 owner_key
+        # （"wecom:<corp>:<app>:<user>"）。从配置 corp_id 或 WECOM_CORP_ID 获取。
+        # app_id 用 bot_id（智能机器人即应用标识）。
+        self._corp_id = str(extra.get("corp_id") or os.getenv("WECOM_CORP_ID", "")).strip()
         self._ws_url = str(
             extra.get("websocket_url")
             or extra.get("websocketUrl")
@@ -523,13 +538,23 @@ class WeComAdapter(BasePlatformAdapter):
         # WeCom AI Bots cannot initiate APP_CMD_SEND in group chats).
         self._remember_chat_req_id(chat_id, self._payload_req_id(payload))
 
+        # 必改 2：主 adapter（WS 智能机器人）生成 owner_key。附件落盘也需要
+        # 这个 key，所以必须在 _extract_media() 之前计算。
+        # app_id 用 bot_id（智能机器人即应用标识），corp_id 从 __init__ 配置获取。
+        from gateway.multi_tenant import build_owner_key
+        _owner_key = build_owner_key(self._corp_id, self._bot_id, sender_id)
+
         text, reply_text = self._extract_text(body)
         # Strip leading @mention in group chats so slash commands like
         # "@BotName /approve" are correctly recognized as "/approve".
         # Mirrors what the Telegram adapter does (re.sub @botname).
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()
-        media_urls, media_types = await self._extract_media(body)
+        media_urls, media_types = await self._extract_media(
+            body,
+            owner_key=_owner_key,
+            upload_id=msg_id,
+        )
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
 
@@ -545,6 +570,7 @@ class WeComAdapter(BasePlatformAdapter):
             chat_type="group" if is_group else "dm",
             user_id=sender_id or None,
             user_name=sender_id or None,
+            owner_key=_owner_key,
         )
 
         event = MessageEvent(
@@ -700,7 +726,13 @@ class WeComAdapter(BasePlatformAdapter):
 
         return "\n".join(part for part in text_parts if part).strip(), reply_text
 
-    async def _extract_media(self, body: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    async def _extract_media(
+        self,
+        body: Dict[str, Any],
+        *,
+        owner_key: str = "",
+        upload_id: str = "",
+    ) -> Tuple[List[str], List[str]]:
         """Best-effort extraction of inbound media to local cache paths."""
         media_paths: List[str] = []
         media_types: List[str] = []
@@ -739,7 +771,12 @@ class WeComAdapter(BasePlatformAdapter):
             refs.append(("file", quote["file"]))
 
         for kind, ref in refs:
-            cached = await self._cache_media(kind, ref)
+            cached = await self._cache_media(
+                kind,
+                ref,
+                owner_key=owner_key,
+                upload_id=upload_id,
+            )
             if cached:
                 path, content_type = cached
                 media_paths.append(path)
@@ -747,8 +784,47 @@ class WeComAdapter(BasePlatformAdapter):
 
         return media_paths, media_types
 
-    async def _cache_media(self, kind: str, media: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    def _cache_owner_upload(
+        self,
+        raw: bytes,
+        filename: str,
+        *,
+        owner_key: str,
+        upload_id: str,
+    ) -> str:
+        """Write inbound media under the current owner's workspace/uploads."""
+        from gateway.multi_tenant import owner_workspace_root
+        from tools.path_security import validate_within_dir
+
+        root = owner_workspace_root(owner_key)
+        upload_segment = _safe_upload_component(upload_id or uuid.uuid4().hex, "upload")
+        safe_name = _safe_upload_component(filename, "wecom_file")
+        target_dir = root / "uploads" / upload_segment
+        target_path = target_dir / safe_name
+        error = validate_within_dir(target_path, root)
+        if error:
+            raise ValueError(f"WeCom upload path escapes owner workspace: {error}")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(raw)
+        return str(target_path)
+
+    async def _cache_media(
+        self,
+        kind: str,
+        media: Dict[str, Any],
+        *,
+        owner_key: str = "",
+        upload_id: str = "",
+    ) -> Optional[Tuple[str, str]]:
         """Cache an inbound image/file/media reference to local storage."""
+        owner_scoped = False
+        try:
+            from gateway.multi_tenant import multi_tenant_enabled
+
+            owner_scoped = multi_tenant_enabled()
+        except Exception:
+            owner_scoped = False
+
         if "base64" in media and media.get("base64"):
             try:
                 raw = self._decode_base64(media["base64"])
@@ -759,12 +835,45 @@ class WeComAdapter(BasePlatformAdapter):
             if kind == "image":
                 ext = self._detect_image_ext(raw)
                 try:
+                    validate_inbound_media_size(len(raw), media_type="image")
+                    if not _looks_like_image(raw):
+                        raise ValueError("non-image bytes")
+                    if owner_scoped:
+                        if not owner_key:
+                            raise ValueError("missing owner key for multi-tenant upload")
+                        return (
+                            self._cache_owner_upload(
+                                raw,
+                                f"wecom_image{ext}",
+                                owner_key=owner_key,
+                                upload_id=upload_id,
+                            ),
+                            self._mime_for_ext(ext, fallback="image/jpeg"),
+                        )
                     return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
                 except ValueError as exc:
                     logger.warning("[%s] Rejected non-image bytes: %s", self.name, exc)
                     return None
 
             filename = str(media.get("filename") or media.get("name") or "wecom_file")
+            if owner_scoped:
+                if not owner_key:
+                    logger.warning("[%s] Missing owner key for multi-tenant file upload", self.name)
+                    return None
+                try:
+                    validate_inbound_media_size(len(raw), media_type="document")
+                    return (
+                        self._cache_owner_upload(
+                            raw,
+                            filename,
+                            owner_key=owner_key,
+                            upload_id=upload_id,
+                        ),
+                        mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                    )
+                except ValueError as exc:
+                    logger.warning("[%s] Rejected inbound file bytes: %s", self.name, exc)
+                    return None
             return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
         url = str(media.get("url") or "").strip()
@@ -789,12 +898,45 @@ class WeComAdapter(BasePlatformAdapter):
         if kind == "image":
             ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
             try:
+                validate_inbound_media_size(len(raw), media_type="image")
+                if not _looks_like_image(raw):
+                    raise ValueError("non-image bytes")
+                if owner_scoped:
+                    if not owner_key:
+                        raise ValueError("missing owner key for multi-tenant upload")
+                    return (
+                        self._cache_owner_upload(
+                            raw,
+                            f"wecom_image{ext}",
+                            owner_key=owner_key,
+                            upload_id=upload_id,
+                        ),
+                        content_type or self._mime_for_ext(ext, fallback="image/jpeg"),
+                    )
                 return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
             except ValueError as exc:
                 logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
                 return None
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
+        if owner_scoped:
+            if not owner_key:
+                logger.warning("[%s] Missing owner key for multi-tenant file upload", self.name)
+                return None
+            try:
+                validate_inbound_media_size(len(raw), media_type="document")
+                return (
+                    self._cache_owner_upload(
+                        raw,
+                        filename,
+                        owner_key=owner_key,
+                        upload_id=upload_id,
+                    ),
+                    content_type,
+                )
+            except ValueError as exc:
+                logger.warning("[%s] Rejected inbound file bytes from %s: %s", self.name, url, exc)
+                return None
         return cache_document_from_bytes(raw, filename), content_type
 
     @staticmethod

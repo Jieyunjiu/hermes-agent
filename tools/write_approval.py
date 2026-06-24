@@ -108,6 +108,26 @@ def _normalize_enabled(value: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 def _pending_dir(subsystem: str) -> Path:
+    try:
+        from gateway.multi_tenant import (
+            get_current_owner_key,
+            hash_owner_key,
+            multi_tenant_enabled,
+        )
+
+        if multi_tenant_enabled():
+            owner_key = get_current_owner_key()
+            # pending 记录代表“待批准的写入”。多租户下如果仍放在全局
+            # pending/<subsystem>，一个用户可能看到或批准另一个用户的待办。
+            return (
+                get_hermes_home()
+                / "pending"
+                / "owners"
+                / hash_owner_key(owner_key)
+                / subsystem
+            )
+    except ImportError:
+        pass
     return get_hermes_home() / "pending" / subsystem
 
 

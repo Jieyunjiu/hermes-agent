@@ -492,6 +492,125 @@ class TestSensitivePathCheck:
         assert result["status"] == "ok"
 
 
+class TestMultiTenantWorkspaceBoundary:
+    def _enable_multi_tenant(self, monkeypatch, workspace_root):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "security": {
+                    "multi_tenant": {
+                        "enabled": True,
+                        "workspace_root": str(workspace_root),
+                    }
+                }
+            },
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_rejects_absolute_path_outside_owner_workspace(
+        self, mock_get, tmp_path, monkeypatch
+    ):
+        """多租户模式下，绝对路径也必须落在当前 owner workspace 内。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/unused/config.yaml")
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+
+        from gateway.multi_tenant import clear_current_owner_key, set_current_owner_key
+        from tools.file_tools import write_file_tool
+
+        try:
+            set_current_owner_key("wecom:corp:app:alice")
+            result = json.loads(write_file_tool(str(tmp_path / "outside.txt"), "secret"))
+        finally:
+            clear_current_owner_key()
+
+        assert result["success"] is False
+        assert "workspace" in result["error"].lower()
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_allows_path_inside_owner_workspace(self, mock_get, tmp_path, monkeypatch):
+        """路径在当前 owner workspace 内时，继续走原来的 FileOperations。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/unused/config.yaml")
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok", "path": "ok.txt", "bytes": 2}
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from gateway.multi_tenant import (
+            clear_current_owner_key,
+            owner_workspace_root,
+            set_current_owner_key,
+        )
+        from tools.file_tools import write_file_tool
+
+        owner = "wecom:corp:app:alice"
+        try:
+            set_current_owner_key(owner)
+            allowed_path = owner_workspace_root(owner) / "ok.txt"
+            result = json.loads(write_file_tool(str(allowed_path), "ok"))
+        finally:
+            clear_current_owner_key()
+
+        assert result["status"] == "ok"
+        mock_ops.write_file.assert_called_once()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_search_files_rejects_path_outside_owner_workspace(
+        self, mock_get, tmp_path, monkeypatch
+    ):
+        """search_files 入口也要单独校验 path，不能只保护 read/write。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+
+        from gateway.multi_tenant import clear_current_owner_key, set_current_owner_key
+        from tools.file_tools import _handle_search_files
+
+        try:
+            set_current_owner_key("wecom:corp:app:alice")
+            result = json.loads(_handle_search_files({"pattern": "x", "path": str(tmp_path)}))
+        finally:
+            clear_current_owner_key()
+
+        assert result["success"] is False
+        assert "workspace" in result["error"].lower()
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_read_file_rejects_symlink_that_resolves_outside_owner_workspace(
+        self, mock_get, tmp_path, monkeypatch
+    ):
+        """路径位于 workspace 内还不够，symlink 的真实目标也必须在 workspace 内。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+
+        from gateway.multi_tenant import (
+            clear_current_owner_key,
+            owner_workspace_root,
+            set_current_owner_key,
+        )
+        from tools.file_tools import read_file_tool
+
+        owner = "wecom:corp:app:alice"
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        try:
+            set_current_owner_key(owner)
+            root = owner_workspace_root(owner)
+            root.mkdir(parents=True, exist_ok=True)
+            link = root / "link.txt"
+            link.symlink_to(outside)
+            result = json.loads(read_file_tool(str(link)))
+        finally:
+            clear_current_owner_key()
+
+        assert result["success"] is False
+        assert "workspace" in result["error"].lower()
+        mock_get.assert_not_called()
+
+
 class TestPatchSchemaShape:
     """PATCH_SCHEMA must advertise per-mode required params via description
     text (not JSON-schema ``required``), so strict models like kimi-k2.x stop

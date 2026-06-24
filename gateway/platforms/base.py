@@ -5077,8 +5077,13 @@ class BasePlatformAdapter(ABC):
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
         role_authorized: bool = False,
+        owner_key: Optional[str] = None,
     ) -> SessionSource:
-        """Helper to build a SessionSource for this platform."""
+        """Helper to build a SessionSource for this platform.
+
+        ``owner_key``（必改 2）：多租户场景下由平台 adapter 传入，格式
+        ``wecom:<corp>:<app>:<user>``。非多租户平台不传，保持原有行为。
+        """
         # Normalize empty topic to None
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
@@ -5098,6 +5103,7 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             role_authorized=role_authorized,
+            owner_key=owner_key,
         )
     
     @abstractmethod

@@ -11257,6 +11257,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            from gateway.multi_tenant import constrain_toolsets_for_owner
+
+            enabled_toolsets, disabled_toolsets = constrain_toolsets_for_owner(
+                enabled_toolsets,
+                disabled_toolsets,
+                owner_key=getattr(source, "owner_key", None) or "",
+            )
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
@@ -12789,6 +12796,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        # 必改 2：把 owner_key 注入 ContextVar。之后所有隔离层
+        # （历史读取、会话恢复、记忆、工作区、上传附件）统一通过
+        # get_current_owner_key() 读取。该 ContextVar 会随 copy_context()
+        # （run.py:12809 _run_in_executor_with_context）传播到 agent 工作
+        # 线程，确保并发消息互不干扰。
+        from gateway.multi_tenant import set_current_owner_key
+        _owner_key = getattr(context.source, "owner_key", None) or ""
+        set_current_owner_key(_owner_key)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -12804,6 +12819,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
         from gateway.session_context import clear_session_vars
+        # 必改 2：清理 owner_key ContextVar，避免跨请求泄漏。
+        from gateway.multi_tenant import clear_current_owner_key
+        clear_current_owner_key()
         clear_session_vars(tokens)
 
     async def _run_in_executor_with_context(self, func, *args):
@@ -14524,6 +14542,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        from gateway.multi_tenant import constrain_toolsets_for_owner
+
+        enabled_toolsets, disabled_toolsets = constrain_toolsets_for_owner(
+            enabled_toolsets,
+            disabled_toolsets,
+            owner_key=getattr(source, "owner_key", None) or "",
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -235,6 +236,52 @@ def test_pending_store_roundtrip(hermes_home):
     assert wa.discard_pending("memory", rec["id"]) is True
     assert wa.pending_count("memory") == 0
     assert wa.get_pending("memory", rec["id"]) is None
+
+
+def test_pending_store_is_owner_scoped_in_multi_tenant_mode(hermes_home, monkeypatch):
+    """多租户模式下，memory pending 队列不能在不同 owner 之间互相可见。"""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"security": {"multi_tenant": {"enabled": True}}},
+    )
+
+    from gateway.multi_tenant import (
+        clear_current_owner_key,
+        hash_owner_key,
+        set_current_owner_key,
+    )
+    from tools import write_approval as wa
+
+    owner_a = "wecom:corp-a:app:alice"
+    owner_b = "wecom:corp-a:app:bob"
+    try:
+        set_current_owner_key(owner_a)
+        rec = wa.stage_write(
+            "memory",
+            {"action": "add", "target": "user", "content": "alice note"},
+            summary="alice note",
+            origin="foreground",
+        )
+        assert wa.pending_count("memory") == 1
+
+        set_current_owner_key(owner_b)
+        assert wa.pending_count("memory") == 0
+        assert wa.get_pending("memory", rec["id"]) is None
+
+        set_current_owner_key(owner_a)
+        assert wa.get_pending("memory", rec["id"]) is not None
+    finally:
+        clear_current_owner_key()
+
+    owner_pending = (
+        Path(hermes_home)
+        / "pending"
+        / "owners"
+        / hash_owner_key(owner_a)
+        / "memory"
+        / f"{rec['id']}.json"
+    )
+    assert owner_pending.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -263,9 +263,56 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     paths are returned resolved-but-unanchored.
     """
     p = Path(_expand_tilde(filepath))
+    multi_tenant_root = _multi_tenant_workspace_root()
+    if multi_tenant_root is not None:
+        if p.is_absolute():
+            return p.resolve()
+        # 多租户模式下，相对路径不再跟随终端 cwd，而是固定落到当前
+        # owner 的 workspace。这样模型无法通过不同 task/cwd 组合写到
+        # 其他用户目录。
+        return (multi_tenant_root / p).resolve()
     if p.is_absolute():
         return p.resolve()
     return (_resolve_base_dir(task_id) / p).resolve()
+
+
+def _multi_tenant_workspace_root() -> Path | None:
+    """Return the current owner's workspace root, or None in legacy mode."""
+    try:
+        from gateway.multi_tenant import (
+            get_current_owner_key,
+            multi_tenant_enabled,
+            owner_workspace_root,
+        )
+
+        if not multi_tenant_enabled():
+            return None
+        return owner_workspace_root(get_current_owner_key())
+    except ImportError:
+        return None
+
+
+def _validate_multi_tenant_workspace_path(path: Path) -> str | None:
+    """Hard-bound file tools to the current owner workspace in multi-tenant mode."""
+    root = _multi_tenant_workspace_root()
+    if root is None:
+        return None
+    from tools.path_security import validate_within_dir
+
+    error = validate_within_dir(path, root)
+    if error:
+        return (
+            "Path is outside the current multi-tenant workspace "
+            f"({root.resolve()}): {error}"
+        )
+    return None
+
+
+def _file_ops_path_for_call(original: str, resolved: Path) -> str:
+    """Use absolute owner-workspace paths only when multi-tenancy is active."""
+    if _multi_tenant_workspace_root() is not None:
+        return str(resolved)
+    return original
 
 
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
@@ -886,6 +933,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         _resolved = _resolve_path_for_task(path, task_id)
+        workspace_error = _validate_multi_tenant_workspace_path(_resolved)
+        if workspace_error:
+            return tool_error(workspace_error, success=False)
+        _file_ops_path = _file_ops_path_for_call(path, _resolved)
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -1017,7 +1068,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        result = file_ops.read_file(_file_ops_path, offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -1296,7 +1347,19 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         try:
             _resolved = str(_resolve_path_for_task(path, task_id))
         except Exception:
+            try:
+                from gateway.multi_tenant import multi_tenant_enabled
+
+                if multi_tenant_enabled():
+                    raise
+            except ImportError:
+                pass
             _resolved = None
+
+        if _resolved is not None:
+            workspace_error = _validate_multi_tenant_workspace_path(Path(_resolved))
+            if workspace_error:
+                return tool_error(workspace_error, success=False)
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
@@ -1396,7 +1459,18 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             try:
                 _r = str(_resolve_path_for_task(_p, task_id))
             except Exception:
+                try:
+                    from gateway.multi_tenant import multi_tenant_enabled
+
+                    if multi_tenant_enabled():
+                        raise
+                except ImportError:
+                    pass
                 _r = None
+            if _r:
+                workspace_error = _validate_multi_tenant_workspace_path(Path(_r))
+                if workspace_error:
+                    return tool_error(workspace_error, success=False)
             if _r and _r not in _seen:
                 _resolved_paths.append(_r)
                 _seen.add(_r)
@@ -1418,6 +1492,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 try:
                     _r = str(_resolve_path_for_task(_p, task_id))
                 except Exception:
+                    try:
+                        from gateway.multi_tenant import multi_tenant_enabled
+
+                        if multi_tenant_enabled():
+                            raise
+                    except ImportError:
+                        pass
                     _r = None
                 _path_to_resolved[_p] = _r
                 _cross = file_state.check_stale(task_id, _r) if _r else None
@@ -1558,9 +1639,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
+        _resolved_search_path = _resolve_path_for_task(path, task_id)
+        workspace_error = _validate_multi_tenant_workspace_path(_resolved_search_path)
+        if workspace_error:
+            return tool_error(workspace_error, success=False)
+        _search_path = _file_ops_path_for_call(path, _resolved_search_path)
+
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=_search_path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         if hasattr(result, 'matches'):

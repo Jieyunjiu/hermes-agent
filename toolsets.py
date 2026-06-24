@@ -542,6 +542,28 @@ TOOLSETS = {
         "includes": []
     },
 
+    "wecom_multi_tenant": {
+        "description": (
+            "WeCom multi-tenant safe toolset: owner-scoped files, memory, "
+            "session search, web research, read-only skills, todo, clarify"
+        ),
+        "tools": [
+            "web_search",
+            "web_extract",
+            "read_file",
+            "write_file",
+            "patch",
+            "search_files",
+            "skills_list",
+            "skill_view",
+            "todo",
+            "memory",
+            "session_search",
+            "clarify",
+        ],
+        "includes": [],
+    },
+
     "hermes-yuanbao": {
         "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情",
         "tools": _HERMES_CORE_TOOLS + [

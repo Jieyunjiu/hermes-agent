@@ -611,6 +611,58 @@ class TestSessionStoreSwitchSession:
         db.close()
 
 
+class TestMultiTenantSessionOwner:
+    def test_build_session_key_includes_owner_hash_for_same_wecom_user(self):
+        """两个 corp 里同名 zhangsan 不能复用同一个 gateway session key。"""
+        source_a = SessionSource(
+            platform=Platform.WECOM,
+            chat_id="zhangsan",
+            chat_type="dm",
+            user_id="zhangsan",
+            owner_key="wecom:corp-a:app:zhangsan",
+        )
+        source_b = SessionSource(
+            platform=Platform.WECOM,
+            chat_id="zhangsan",
+            chat_type="dm",
+            user_id="zhangsan",
+            owner_key="wecom:corp-b:app:zhangsan",
+        )
+
+        key_a = build_session_key(source_a)
+        key_b = build_session_key(source_b)
+
+        assert key_a != key_b
+        assert ":o" in key_a
+        assert ":o" in key_b
+        assert key_a.endswith(":wecom:dm:zhangsan")
+        assert key_b.endswith(":wecom:dm:zhangsan")
+
+    def test_reset_session_preserves_owner_key_in_new_db_row(self, tmp_path, monkeypatch):
+        """`/reset`/`/new` 生成的新 session 也必须继续属于当前 owner。"""
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        owner = "wecom:corp:app:alice"
+        source = SessionSource(
+            platform=Platform.WECOM,
+            chat_id="alice",
+            chat_type="dm",
+            user_id="alice",
+            owner_key=owner,
+        )
+
+        entry = store.get_or_create_session(source)
+        reset_entry = store.reset_session(entry.session_key)
+
+        assert reset_entry is not None
+        assert store._db.get_session(entry.session_id)["owner_key"] == owner
+        assert store._db.get_session(reset_entry.session_id)["owner_key"] == owner
+        store._db.close()
+
+
 class TestSessionStoreLookupBySessionId:
     @pytest.fixture()
     def store(self, tmp_path):

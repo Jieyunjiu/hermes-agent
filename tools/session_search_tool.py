@@ -131,7 +131,7 @@ def _resolve_profile_db(profile: str):
     return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
 
 
-def _locate_session_db(session_id: str):
+def _locate_session_db(session_id: str, owner_key: str = None):
     """Scan every profile's ``state.db`` (read-only) for a session id.
 
     Returns ``(db, profile_name)`` for the first profile that owns the id, or
@@ -139,8 +139,16 @@ def _locate_session_db(session_id: str):
     so the first hit is authoritative. This is the safety net for linked-session
     reads where the model dropped the owning profile from the link and passed a
     bare id — we find it wherever it actually lives instead of failing.
+
+    多租户模式（必改 3）：当 owner_key 非空时，禁用跨 profile 扫描。跨 profile
+    扫描会绕过 owner 隔离边界（不同 profile 是独立隔离岛），直接返回未找到，
+    避免 A 通过跨 profile 定位到 B 的 session。
     """
     from pathlib import Path
+
+    # 必改 3：多租户模式下禁用跨 profile 扫描，防止绕过隔离边界。
+    if owner_key:
+        return None, None
 
     try:
         from hermes_cli import profiles as profiles_mod
@@ -175,14 +183,25 @@ def _locate_session_db(session_id: str):
     return None, None
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
+def _read_session(db, session_id: str, head: int = 20, tail: int = 10,
+                  owner_key: str = None) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
     the agent wants the transcript. Bounded payload: small sessions return in
     full, large ones return the first ``head`` and last ``tail`` messages with a
     pointer to scroll the middle.
+
+    ``owner_key``（必改 3）：多租户模式下校验目标 session 是否属于当前 owner，
+    不属于则返回 not found（防枚举，不泄漏存在性）。
     """
+    # 必改 3：owner 校验。fail-closed——owner_key 缺失（非多租户）时放行。
+    if owner_key:
+        from gateway.multi_tenant import assert_session_owner
+        err = assert_session_owner(db, session_id, owner_key)
+        if err:
+            return tool_error(f"session_id not found: {session_id}", success=False)
+
     try:
         meta = db.get_session(session_id) or {}
     except Exception as e:
@@ -224,13 +243,16 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(db, limit: int, current_session_id: str = None,
+                          owner_key: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = db.list_sessions_rich(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            # 必改 3：多租户模式下只列出当前 owner 的会话。
+            owner_key=owner_key or None,
         )  # fetch extra so we can skip current
 
         current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
@@ -273,16 +295,27 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    owner_key: str = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
     No FTS5, no bookends — just the slice. The discovery shape's lineage
     fixup is preserved: if the anchor doesn't live in the named session
     but does live in a child session in the same lineage, rebind silently.
+
+    ``owner_key``（必改 3）：校验目标 session（及 lineage rebind 的目标）
+    是否属于当前 owner。
     """
     if not isinstance(session_id, str) or not session_id.strip():
         return tool_error("scroll requires session_id", success=False)
     session_id = session_id.strip()
+
+    # 必改 3：owner 校验——防止跨租户读取。
+    if owner_key:
+        from gateway.multi_tenant import assert_session_owner
+        err = assert_session_owner(db, session_id, owner_key)
+        if err:
+            return tool_error(f"session_id not found: {session_id}", success=False)
 
     try:
         around_message_id = int(around_message_id)
@@ -347,22 +380,30 @@ def _scroll(
             a_root = _resolve_to_parent(db, session_id)
             o_root = _resolve_to_parent(db, owning)
             if a_root and o_root and a_root == o_root:
-                try:
-                    rebind_view = db.get_messages_around(owning, around_message_id, window=window)
-                    messages = rebind_view.get("window") or []
-                    if messages:
-                        view = rebind_view
-                        rebind_warning = (
-                            f"around_message_id {around_message_id} lives in {owning} "
-                            f"(child of {session_id}); rebound transparently"
-                        )
-                        try:
-                            session_meta = db.get_session(owning) or session_meta
-                        except Exception:
-                            pass
-                        session_id = owning
-                except Exception as e:
-                    logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
+                # 必改 3：lineage rebind 校验目标 session 的 owner，
+                # 防止跨租户 lineage 碰撞导致越权读取。
+                _rebind_ok = True
+                if owner_key:
+                    from gateway.multi_tenant import assert_session_owner
+                    if assert_session_owner(db, owning, owner_key):
+                        _rebind_ok = False
+                if _rebind_ok:
+                    try:
+                        rebind_view = db.get_messages_around(owning, around_message_id, window=window)
+                        messages = rebind_view.get("window") or []
+                        if messages:
+                            view = rebind_view
+                            rebind_warning = (
+                                f"around_message_id {around_message_id} lives in {owning} "
+                                f"(child of {session_id}); rebound transparently"
+                            )
+                            try:
+                                session_meta = db.get_session(owning) or session_meta
+                            except Exception:
+                                pass
+                            session_id = owning
+                    except Exception as e:
+                        logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
 
     if not messages:
         return tool_error(
@@ -398,6 +439,7 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    owner_key: str = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
@@ -410,6 +452,8 @@ def _discover(
             limit=50,  # widen so dedup-by-lineage can find distinct sessions
             offset=0,
             sort=sort,
+            # 必改 3：多租户模式下只搜索当前 owner 的消息。
+            owner_key=owner_key or None,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -527,6 +571,24 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
+    # 必改 3：多租户模式必须 fail-closed。这里是所有历史检索形态的入口，
+    # 不能在缺 owner_key 时退化为全局搜索，否则 browse/discover/read 都可能
+    # 穿透到别人的会话。
+    try:
+        from gateway.multi_tenant import (
+            OwnerKeyMissing,
+            get_current_owner_key,
+            multi_tenant_enabled,
+        )
+
+        _multi_tenant = multi_tenant_enabled()
+        _owner_key = get_current_owner_key() if _multi_tenant else None
+    except OwnerKeyMissing as exc:
+        return tool_error(str(exc), success=False)
+    except Exception:
+        _multi_tenant = False
+        _owner_key = None
+
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
     # always strip the prefix off the id, and adopt the embedded profile only
@@ -539,10 +601,19 @@ def session_search(
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
 
+    if _multi_tenant and profile is not None and str(profile).strip():
+        return tool_error(
+            "profile reads are disabled in multi-tenant mode",
+            success=False,
+        )
+
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
+    # 必改 3：显式跨 profile 读取是另一个隔离边界（profile 是独立岛），
+    # 不应用当前 owner_key 过滤——owner 过滤只在自己 profile 内生效。
     if profile is not None and str(profile).strip():
+        _owner_key = None
         try:
             profile_db = _resolve_profile_db(profile)
         except Exception as e:
@@ -559,22 +630,24 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            owner_key=_owner_key,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid)
+        result = _read_session(db, sid, owner_key=_owner_key)
         if json.loads(result).get("success"):
             return result
 
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
+        # 必改 3：多租户模式下 _locate_session_db 禁用跨 profile 扫描（返回 None）。
+        located, owner = _locate_session_db(sid, owner_key=_owner_key)
         if located is not None:
             try:
-                found = json.loads(_read_session(located, sid))
+                found = json.loads(_read_session(located, sid, owner_key=_owner_key))
             finally:
                 located.close()
             if found.get("success"):
@@ -592,7 +665,7 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(db, limit, current_session_id, owner_key=_owner_key)
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -613,6 +686,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        owner_key=_owner_key,
     )
 
 

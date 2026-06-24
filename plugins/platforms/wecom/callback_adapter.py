@@ -358,12 +358,18 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             root.findtext("MsgId")
             or f"{user_id}:{root.findtext('CreateTime', default='0')}"
         )
+        # 必改 2：生成多租户 owner_key。callback adapter 已持有 corp_id
+        # （XML ToUserName 或 app 配置）与 app（含 agent_id 作为 app_id），
+        # 三者拼出 "wecom:<corp>:<app>:<user>"，由 build_session_key 纳入路由。
+        from gateway.multi_tenant import build_owner_key
+        app_id = str(app.get("agent_id") or app.get("name") or "")
         source = self.build_source(
             chat_id=scoped_chat_id,
             chat_name=user_id,
             chat_type="dm",
             user_id=user_id,
             user_name=user_id,
+            owner_key=build_owner_key(corp_id, app_id, user_id),
         )
         return MessageEvent(
             text=content,

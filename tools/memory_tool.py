@@ -54,6 +54,21 @@ logger = logging.getLogger(__name__)
 # happened after the first import.
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
+    try:
+        from gateway.multi_tenant import (
+            get_current_owner_key,
+            hash_owner_key,
+            multi_tenant_enabled,
+        )
+
+        if multi_tenant_enabled():
+            owner_key = get_current_owner_key()
+            # 多租户模式下不能继续使用 profile 全局 memories 目录，否则不同
+            # 企业微信用户会共享 MEMORY.md / USER.md。目录名只使用 owner_key
+            # 的 hash，避免把企业/用户标识直接暴露到文件路径里。
+            return get_hermes_home() / "memories" / "owners" / hash_owner_key(owner_key)
+    except ImportError:
+        pass
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
@@ -1083,7 +1098,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

@@ -119,7 +119,12 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
-    
+    # 多租户 owner key（必改 2）：格式 "wecom:<corp>:<app>:<user>"，由 WeCom
+    # adapter 在构造 source 时生成。所有隔离面（路由、历史、记忆、工作区、
+    # 上传附件、工具面）都用同一个 key 收敛。None/空 表示非多租户路径（CLI/
+    # cron/单用户 gateway），保持原有全局行为。详见 gateway/multi_tenant.py。
+    owner_key: Optional[str] = None
+
     @property
     def description(self) -> str:
         """Human-readable description of the source."""
@@ -164,6 +169,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.owner_key:
+            d["owner_key"] = self.owner_key
         return d
 
     @classmethod
@@ -183,6 +190,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            owner_key=data.get("owner_key"),
         )
     
 
@@ -708,9 +716,22 @@ def build_session_key(
       - Without participant identifiers, or when isolation is disabled, messages fall back to one
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
+
+    多租户模式（必改 2）：当 source 携带 owner_key 时，把 owner_hash 作为
+    namespace 前缀纳入 key。这样两个 corp 里都叫 "zhangsan" 的用户，
+    即使 chat_id 相同（WeCom DM chat_id = 裸 sender_id），也会路由到不同
+    的 cached agent，彻底杜绝历史串号。owner_hash = sha256(owner_key)[:16]，
+    仅含十六进制字符，不可能引发路径注入或碰撞。
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+    # 必改 2：多租户模式下用 owner_hash 作为隔离维度。注意这是在 DB 之前的
+    # 路由层生效——只改 DB 过滤不够，因为 cached agent 复用发生在 DB 之前。
+    if getattr(source, "owner_key", None):
+        from gateway.multi_tenant import hash_owner_key
+        owner_segment = hash_owner_key(source.owner_key)
+        if owner_segment:
+            ns = f"{ns}:o{owner_segment}"
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -1058,6 +1079,10 @@ class SessionStore:
                 "source": source.platform.value,
                 "user_id": source.user_id,
             }
+            # 必改 4：gateway 普通会话创建时写入 owner_key，使 DB 过滤能正确收敛。
+            owner_key = getattr(source, "owner_key", None)
+            if owner_key:
+                db_create_kwargs["owner_key"] = owner_key
 
         # SQLite operations outside the lock
         if self._db and db_end_session_id:
@@ -1284,6 +1309,10 @@ class SessionStore:
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
             }
+            if old_entry.origin and old_entry.origin.owner_key:
+                # /reset、/new 会换一个新的 session_id，但仍然是同一个
+                # 企业微信用户的会话，SQLite 记录必须继续带 owner_key。
+                db_create_kwargs["owner_key"] = old_entry.origin.owner_key
 
         if self._db and db_end_session_id:
             try:
@@ -1299,7 +1328,8 @@ class SessionStore:
 
         return new_entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(self, session_key: str, target_session_id: str,
+                       owner_key: str = None) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
         Used by ``/resume`` to restore a previously-named session.
@@ -1307,7 +1337,25 @@ class SessionStore:
         generating a fresh session ID, re-uses ``target_session_id`` so the
         old transcript is loaded on the next message. If the target session was
         previously ended, re-open it so gateway resume semantics match the CLI.
+
+        ``owner_key``（必改 9，defense-in-depth）：当非空时，切换前校验目标
+        session 是否属于该 owner。不通过则返回 None（上游已校验，这是兜底）。
         """
+        # 必改 9：defense-in-depth owner 校验。万一上游 /resume 漏了校验，
+        # 这里再拦一次，确保不会切到他人 session。
+        if owner_key and self._db:
+            try:
+                from gateway.multi_tenant import assert_session_owner
+                _err = assert_session_owner(self._db, target_session_id, owner_key)
+                if _err:
+                    logger.warning(
+                        "switch_session blocked: target %s not owned by current "
+                        "owner (defense-in-depth check)", target_session_id,
+                    )
+                    return None
+            except Exception:
+                logger.debug("switch_session owner check failed", exc_info=True)
+
         db_end_session_id = None
         new_entry = None
 

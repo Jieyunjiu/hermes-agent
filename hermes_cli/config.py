@@ -2315,6 +2315,12 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        # 企业微信等网关的多租户隔离默认关闭；开启后会按 owner_key
+        # 分隔历史、memory、pending 写入和文件工作区。
+        "multi_tenant": {
+            "enabled": False,
+            "workspace_root": "/data/workspaces",
+        },
         "website_blocklist": {
             "enabled": False,
             "domains": [],

@@ -1166,8 +1166,20 @@ def init_agent(
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            _multi_tenant_memory_provider_disabled = False
+            try:
+                from gateway.multi_tenant import multi_tenant_enabled
 
-            if _mem_provider_name and _mem_provider_name.strip():
+                _multi_tenant_memory_provider_disabled = multi_tenant_enabled()
+            except Exception:
+                _multi_tenant_memory_provider_disabled = False
+
+            if _mem_provider_name and _mem_provider_name.strip() and _multi_tenant_memory_provider_disabled:
+                _ra().logger.warning(
+                    "Memory provider '%s' disabled in multi-tenant gateway mode",
+                    _mem_provider_name,
+                )
+            elif _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()

@@ -15,13 +15,14 @@ from gateway.session import SessionSource, build_session_key
 
 
 def _make_event(text="/resume", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890"):
+                user_id="12345", chat_id="67890", owner_key=None):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
         user_name="testuser",
+        owner_key=owner_key,
     )
     return MessageEvent(text=text, source=source)
 
@@ -360,6 +361,101 @@ class TestHandleResumeCommand:
         assert "not found" not in str(result).lower(), (
             f"session-id lookup failed: {result!r}"
         )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_multi_tenant_resume_by_foreign_session_id_returns_not_found(self, tmp_path):
+        """用户知道别人 session id 时，也不能 `/resume` 到别人的历史。"""
+        from hermes_state import SessionDB
+
+        owner_a = "wecom:corp:app:alice"
+        owner_b = "wecom:corp:app:bob"
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("bob_session", "wecom", owner_key=owner_b)
+        db.create_session("alice_current", "wecom", owner_key=owner_a)
+
+        event = _make_event(
+            text="/resume bob_session",
+            platform=Platform.WECOM,
+            user_id="alice",
+            chat_id="alice",
+            owner_key=owner_a,
+        )
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="alice_current",
+            event=event,
+        )
+
+        result = await runner._handle_resume_command(event)
+
+        assert "No session found" in result
+        runner.session_store.switch_session.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_multi_tenant_resume_by_foreign_title_returns_not_found(self, tmp_path):
+        """title 解析也必须按 owner 过滤，不能全局匹配同名/已知标题。"""
+        from hermes_state import SessionDB
+
+        owner_a = "wecom:corp:app:alice"
+        owner_b = "wecom:corp:app:bob"
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("bob_session", "wecom", owner_key=owner_b)
+        db.set_session_title("bob_session", "Bob Secret")
+        db.create_session("alice_current", "wecom", owner_key=owner_a)
+
+        event = _make_event(
+            text="/resume Bob Secret",
+            platform=Platform.WECOM,
+            user_id="alice",
+            chat_id="alice",
+            owner_key=owner_a,
+        )
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="alice_current",
+            event=event,
+        )
+
+        result = await runner._handle_resume_command(event)
+
+        assert "No session found" in result
+        runner.session_store.switch_session.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_multi_tenant_resume_foreign_compression_tip_returns_not_found(self, tmp_path):
+        """即使 root id/title 被猜到，跟随 compression tip 后仍要校验最终 owner。"""
+        from hermes_state import SessionDB
+
+        owner_a = "wecom:corp:app:alice"
+        owner_b = "wecom:corp:app:bob"
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("bob_root", "wecom", owner_key=owner_b)
+        db.set_session_title("bob_root", "Compressed Secret")
+        db.end_session("bob_root", "compression")
+        db.create_session("bob_tip", "wecom", parent_session_id="bob_root")
+        db.append_message("bob_tip", "user", "secret continuation")
+        db.create_session("alice_current", "wecom", owner_key=owner_a)
+
+        event = _make_event(
+            text="/resume bob_root",
+            platform=Platform.WECOM,
+            user_id="alice",
+            chat_id="alice",
+            owner_key=owner_a,
+        )
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="alice_current",
+            event=event,
+        )
+
+        result = await runner._handle_resume_command(event)
+
+        assert "No session found" in result
+        runner.session_store.switch_session.assert_not_called()
         db.close()
 
 

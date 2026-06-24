@@ -12,6 +12,17 @@ from tools.memory_tool import (
 )
 
 
+def _enable_multi_tenant(monkeypatch, workspace_root=None):
+    """让测试只打开多租户开关，不读取真实用户配置。"""
+    mt = {"enabled": True}
+    if workspace_root is not None:
+        mt["workspace_root"] = str(workspace_root)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"security": {"multi_tenant": mt}},
+    )
+
+
 # =========================================================================
 # Tool schema guidance
 # =========================================================================
@@ -26,6 +37,65 @@ class TestMemorySchema:
         assert "like a diary" not in description
         assert "todo state" in description
         assert ">80%" not in description
+
+
+class TestMultiTenantMemoryIsolation:
+    def test_memory_dir_uses_owner_hash_when_multi_tenant_enabled(self, tmp_path, monkeypatch):
+        """多租户模式下，两个 owner 不能读写同一个 MEMORY.md / USER.md。"""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        _enable_multi_tenant(monkeypatch)
+
+        from gateway.multi_tenant import (
+            clear_current_owner_key,
+            hash_owner_key,
+            set_current_owner_key,
+        )
+        from tools.memory_tool import get_memory_dir
+
+        try:
+            owner_a = "wecom:corp-a:app:zhangsan"
+            owner_b = "wecom:corp-b:app:zhangsan"
+            set_current_owner_key(owner_a)
+            dir_a = get_memory_dir()
+            set_current_owner_key(owner_b)
+            dir_b = get_memory_dir()
+        finally:
+            clear_current_owner_key()
+
+        assert dir_a != dir_b
+        assert dir_a == tmp_path / ".hermes" / "memories" / "owners" / hash_owner_key(owner_a)
+        assert dir_b == tmp_path / ".hermes" / "memories" / "owners" / hash_owner_key(owner_b)
+
+    def test_memory_store_roundtrip_stays_inside_current_owner_dir(self, tmp_path, monkeypatch):
+        """MemoryStore 的真实落盘路径也必须跟随当前 owner。"""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        _enable_multi_tenant(monkeypatch)
+
+        from gateway.multi_tenant import (
+            clear_current_owner_key,
+            hash_owner_key,
+            set_current_owner_key,
+        )
+
+        owner_a = "wecom:corp-a:app:alice"
+        owner_b = "wecom:corp-a:app:bob"
+        try:
+            set_current_owner_key(owner_a)
+            store_a = MemoryStore()
+            store_a.load_from_disk()
+            assert store_a.add("memory", "alice-only preference")["success"] is True
+
+            set_current_owner_key(owner_b)
+            store_b = MemoryStore()
+            store_b.load_from_disk()
+        finally:
+            clear_current_owner_key()
+
+        assert store_b.memory_entries == []
+        owner_a_file = (
+            tmp_path / ".hermes" / "memories" / "owners" / hash_owner_key(owner_a) / "MEMORY.md"
+        )
+        assert "alice-only preference" in owner_a_file.read_text(encoding="utf-8")
 
 
 # =========================================================================

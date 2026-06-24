@@ -554,6 +554,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_error TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    -- Multi-tenant owner key (必改 1): partitions every per-user surface
+    -- (history reads, session resume, search) by the owning WeCom user.
+    -- Format "wecom:<corp>:<app>:<user>". NULL/empty for sessions created
+    -- outside multi-tenant mode (single-user / CLI / cron). See
+    -- gateway/multi_tenant.py. The declarative reconciler ADDs this column
+    -- to existing DBs on next startup — no version-gated migration needed.
+    owner_key TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -1147,6 +1154,20 @@ class SessionDB:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
+        # Multi-tenant owner_key index (必改 3): the owner-filtered history
+        # queries (search_messages / list_sessions_rich / search_sessions /
+        # search_sessions_by_id / resolve_session_by_title) all add a
+        # ``WHERE owner_key = ?`` clause, so an index on the column keeps
+        # those scans fast as the per-tenant row count grows. Created here
+        # (after reconcile) because owner_key is a reconciler-added column.
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_owner_key "
+                "ON sessions(owner_key) WHERE owner_key IS NOT NULL"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("idx_sessions_owner_key create skipped: %s", exc)
+
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
         cursor.executescript(DEFERRED_INDEX_SQL)
@@ -1355,13 +1376,41 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
+        owner_key: str = None,
     ) -> None:
-        """Shared INSERT OR IGNORE for session rows."""
+        """Shared INSERT OR IGNORE for session rows.
+
+        Multi-tenant owner_key (必改 1 & 4): the owner_key partitions every
+        per-user surface by the owning WeCom user. Callers SHOULD pass it
+        explicitly; when omitted (``None``) and a ``parent_session_id`` is
+        present, the row *inherits* the parent's owner_key as a defense-in-
+        depth fallback so compression continuations / branches / forks that
+        forget to thread the key still land under the right owner. Under
+        multi-tenant mode a genuinely-missing owner_key (no parent either)
+        is left NULL, which the read-side filters treat as "visible to
+        nobody" — fail-closed.
+        """
+        # 必改 4 — inherit owner_key from parent when the caller didn't pass one.
+        # This is the safety net for child-session creation paths (compression
+        # continuation, /branch, /fork) that may not thread owner_key through.
+        if owner_key is None and parent_session_id:
+            try:
+                prow = self._conn.execute(
+                    "SELECT owner_key FROM sessions WHERE id = ?", (parent_session_id,)
+                ).fetchone()
+                if prow is not None:
+                    owner_key = prow["owner_key"] or None
+            except Exception:
+                logger.debug(
+                    "owner_key inheritance lookup failed for parent %s",
+                    parent_session_id, exc_info=True,
+                )
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, cwd, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, cwd, owner_key, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -1371,6 +1420,7 @@ class SessionDB:
                     system_prompt,
                     parent_session_id,
                     cwd,
+                    owner_key,
                     time.time(),
                 ),
             )
@@ -1993,35 +2043,58 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+    def get_session_by_title(self, title: str, owner_key: str = None) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title. Returns session dict or None.
+
+        When *owner_key* is given (multi-tenant mode), the lookup is
+        restricted to sessions owned by that owner (必改 3) so a user
+        cannot resolve another user's titled session.
+        """
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
-            )
+            if owner_key:
+                cursor = self._conn.execute(
+                    "SELECT * FROM sessions WHERE title = ? AND owner_key = ?",
+                    (title, owner_key),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "SELECT * FROM sessions WHERE title = ?", (title,)
+                )
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(self, title: str, owner_key: str = None) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
         If not, searches for "title #N" variants and returns the latest one.
         If the exact title exists AND numbered variants exist, returns the
         latest numbered variant (the most recent continuation).
+
+        When *owner_key* is given (multi-tenant mode, 必改 3 & 9), the
+        resolution is restricted to the owner's sessions so a user cannot
+        ``/resume`` another user's titled conversation.
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, owner_key=owner_key)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
-            )
+            if owner_key:
+                cursor = self._conn.execute(
+                    "SELECT id, title, started_at FROM sessions "
+                    "WHERE title LIKE ? ESCAPE '\\' AND owner_key = ? "
+                    "ORDER BY started_at DESC",
+                    (f"{escaped} #%", owner_key),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "SELECT id, title, started_at FROM sessions "
+                    "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
+                    (f"{escaped} #%",),
+                )
             numbered = cursor.fetchall()
 
         if numbered:
@@ -2115,6 +2188,7 @@ class SessionDB:
         include_archived: bool = False,
         archived_only: bool = False,
         id_query: str = None,
+        owner_key: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -2178,6 +2252,13 @@ class SessionDB:
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+
+        # 多租户 owner 过滤（必改 3）：仅暴露属于该 owner_key 的会话。
+        # 在多租户模式下，owner_key 为空/NULL 的历史会话（非多租户模式
+        # 创建的）被排除，租户永远看不到全局/遗留行。
+        if owner_key:
+            where_clauses.append("s.owner_key = ?")
+            params.append(owner_key)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -3473,6 +3554,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        owner_key: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -3555,6 +3637,12 @@ class SessionDB:
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
 
+        # 多租户 owner 过滤（必改 3）：FTS5 主路径同样按 owner_key 收敛，
+        # 防止跨租户消息泄露到搜索结果。
+        if owner_key:
+            where_clauses.append("s.owner_key = ?")
+            params.append(owner_key)
+
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
@@ -3630,6 +3718,10 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                # 多租户 owner 过滤（必改 3）：trigram CJK 路径同样收敛。
+                if owner_key:
+                    tri_where.append("s.owner_key = ?")
+                    tri_params.append(owner_key)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -3687,6 +3779,10 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                # 多租户 owner 过滤（必改 3）：LIKE fallback 路径同样收敛。
+                if owner_key:
+                    like_where.append("s.owner_key = ?")
+                    like_params.append(owner_key)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -3789,6 +3885,7 @@ class SessionDB:
         query: str,
         limit: int = 20,
         include_archived: bool = True,
+        owner_key: str = None,
     ) -> List[Dict[str, Any]]:
         """Search surfaced sessions by exact/prefix/substring session id.
 
@@ -3797,6 +3894,9 @@ class SessionDB:
         straight to that conversation.  Matching also checks ``_lineage_root_id``
         for projected compression-chain tips, so an old root id still resolves to
         the live continuation row.
+
+        When *owner_key* is given (multi-tenant mode, 必改 3)，仅在该 owner 的
+        会话范围内搜索，跨租户 id 碰撞也不会命中他人会话。
         """
         needle = (query or "").strip().lower()
         if not needle or limit <= 0:
@@ -3814,6 +3914,7 @@ class SessionDB:
             include_archived=include_archived,
             order_by_last_active=True,
             id_query=needle,
+            owner_key=owner_key,
         )
 
         def score(row: Dict[str, Any]) -> int:
@@ -3836,12 +3937,16 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        owner_key: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
         Returns rows enriched with a computed ``last_active`` column (latest
         message timestamp for the session, falling back to ``started_at``),
         ordered by most-recently-used first.
+
+        When *owner_key* is given (multi-tenant mode, 必改 3)，仅返回该 owner
+        名下的会话。
         """
         select_with_last_active = (
             "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
@@ -3851,13 +3956,25 @@ class SessionDB:
             "FROM messages GROUP BY session_id"
             ") m ON m.session_id = s.id "
         )
+        # 多租户 owner 过滤片段（必改 3）：source 与非 source 两条分支共用。
+        owner_clause = " AND s.owner_key = ?" if owner_key else ""
         with self._lock:
             if source:
+                owner_params: list = [source]
+                if owner_key:
+                    owner_params.append(owner_key)
                 cursor = self._conn.execute(
                     f"{select_with_last_active}"
-                    "WHERE s.source = ? "
+                    f"WHERE s.source = ?{owner_clause} "
                     "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
+                    (*owner_params, limit, offset),
+                )
+            elif owner_key:
+                cursor = self._conn.execute(
+                    f"{select_with_last_active}"
+                    "WHERE s.owner_key = ? "
+                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                    (owner_key, limit, offset),
                 )
             else:
                 cursor = self._conn.execute(

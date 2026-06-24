@@ -3,7 +3,18 @@ from unittest.mock import MagicMock, patch
 import json
 import sys
 
+import pytest
+
+import run_agent
 from run_agent import AIAgent
+
+
+@pytest.fixture(autouse=True)
+def _redirect_hermes_home(tmp_path, monkeypatch):
+    """这些用例会构造 AIAgent，日志必须写到 pytest 临时目录。"""
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(run_agent, "_hermes_home", hermes_home)
 
 
 def _mock_response(*, usage: dict, content: str = "done"):
@@ -93,3 +104,37 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     assert captured["db"] is sentinel_db
     assert captured["query"] == "Hermes"
     assert agent._session_db is sentinel_db
+
+
+def test_runtime_session_search_honors_owner_context(tmp_path, monkeypatch):
+    """运行时特殊分支也必须继承 ContextVar owner，不能退回全局历史。"""
+    from gateway.multi_tenant import clear_current_owner_key, set_current_owner_key
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"security": {"multi_tenant": {"enabled": True}}},
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("alice-session", "wecom", owner_key="wecom:corp:app:alice")
+    db.create_session("bob-session", "wecom", owner_key="wecom:corp:app:bob")
+    db.append_message("bob-session", "user", "bobsecretneedle belongs to bob")
+
+    agent = _make_agent(db, platform="wecom")
+    agent.session_id = "alice-session"
+
+    try:
+        set_current_owner_key("wecom:corp:app:alice")
+        raw = agent._invoke_tool(
+            "session_search",
+            {"query": "bobsecretneedle", "limit": 5},
+            "task-id",
+        )
+    finally:
+        clear_current_owner_key()
+        db.close()
+
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert result["results"] == []
