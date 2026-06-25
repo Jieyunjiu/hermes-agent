@@ -42,12 +42,16 @@ def query_session_listing(
     include_unnamed: bool = False,
     limit: int = 10,
     exclude_sources: list[str] | None = None,
+    owner_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return session rows for interactive listing surfaces.
 
     This is the shared selection policy behind CLI/gateway session browsing:
     source-scoped by default, optionally global, hide unnamed sessions unless
     the caller asks for a full listing, and never include the current session.
+    ``owner_key`` 是 gateway 多租户隔离用的硬边界：即使调用方请求
+    ``include_all_sources``，也只能列出当前 owner 名下的会话，避免
+    `/sessions all` 变成跨租户枚举入口。
     """
     query_source = None if include_all_sources else source
     fetch_limit = max(limit * 4, limit)
@@ -55,6 +59,7 @@ def query_session_listing(
         source=query_source,
         exclude_sources=exclude_sources,
         limit=fetch_limit,
+        owner_key=owner_key or None,
     )
     result: list[dict[str, Any]] = []
     for row in rows:

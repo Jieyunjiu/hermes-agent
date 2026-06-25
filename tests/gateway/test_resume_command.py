@@ -503,6 +503,68 @@ class TestHandleSessionsCommand:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_sessions_command_filters_by_owner_key(self, tmp_path):
+        """多租户 `/sessions` 不能枚举同 source 下其他 owner 的标题和 id。"""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        owner_a = "wecom:corp-a:app:alice"
+        owner_b = "wecom:corp-b:app:bob"
+        db.create_session("alice_wecom", "wecom", owner_key=owner_a)
+        db.set_session_title("alice_wecom", "Alice Session")
+        db.create_session("bob_wecom", "wecom", owner_key=owner_b)
+        db.set_session_title("bob_wecom", "Bob Session")
+
+        event = _make_event(
+            text="/sessions",
+            platform=Platform.WECOM,
+            user_id="alice",
+            chat_id="alice",
+            owner_key=owner_a,
+        )
+        runner = _make_runner(session_db=db, event=event)
+
+        result = await runner._handle_sessions_command(event)
+
+        assert "Alice Session" in result
+        assert "alice_wecom" in result
+        assert "Bob Session" not in result
+        assert "bob_wecom" not in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_sessions_all_full_still_filters_by_owner_key(self, tmp_path):
+        """`all/full` 只能放宽 source/标题过滤，不能放宽 owner 隔离。"""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        owner_a = "wecom:corp-a:app:alice"
+        owner_b = "wecom:corp-b:app:bob"
+        db.create_session("alice_wecom", "wecom", owner_key=owner_a)
+        db.set_session_title("alice_wecom", "Alice WeCom")
+        db.create_session("alice_discord", "discord", owner_key=owner_a)
+        db.append_message("alice_discord", "user", "alice discord prompt")
+        db.create_session("bob_wecom", "wecom", owner_key=owner_b)
+        db.set_session_title("bob_wecom", "Bob WeCom")
+
+        event = _make_event(
+            text="/sessions all full",
+            platform=Platform.WECOM,
+            user_id="alice",
+            chat_id="alice",
+            owner_key=owner_a,
+        )
+        runner = _make_runner(session_db=db, event=event)
+
+        result = await runner._handle_sessions_command(event)
+
+        assert "Alice WeCom" in result
+        assert "alice_discord" in result
+        assert "Bob WeCom" not in result
+        assert "bob_wecom" not in result
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_gateway_dispatches_sessions_command(self, tmp_path):
         from hermes_state import SessionDB
         db = SessionDB(db_path=tmp_path / "state.db")

@@ -3000,6 +3000,7 @@ class GatewaySlashCommandsMixin:
                     session_id=session_id,
                     source=source.platform.value if source.platform else "unknown",
                     user_id=source.user_id,
+                    owner_key=getattr(source, "owner_key", None) or None,
                 )
             except Exception:
                 pass  # Session might already exist, ignore errors
@@ -3257,6 +3258,7 @@ class GatewaySlashCommandsMixin:
             include_unnamed=include_unnamed,
             limit=10,
             exclude_sources=["tool"],
+            owner_key=getattr(source, "owner_key", None),
         )
         if source.platform == Platform.MATRIX and not include_all:
             rows = [

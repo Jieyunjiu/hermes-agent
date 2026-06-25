@@ -161,6 +161,11 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
+        # 多租户隐式依赖说明：get_memory_dir() 会读取当前 ContextVar owner_key。
+        # 网关必须先通过 _set_session_env() 绑定 owner，再构造 AIAgent /
+        # MemoryStore；并且 cached agent 必须按 owner 隔离（session_key 含
+        # owner_hash，agent cache signature 也含 owner_key）。否则这里冻结的
+        # _system_prompt_snapshot 可能来自另一个 owner 的 MEMORY.md / USER.md。
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1098,6 +1103,5 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 

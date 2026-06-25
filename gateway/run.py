@@ -13562,6 +13562,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        owner_key: str | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -13589,6 +13590,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         broke #27371's per-user-peer contract in multi-user gateways.
         Per-user agent rebuilds in shared threads trade prompt-cache
         warmth for correct memory attribution.
+
+        ``owner_key`` 是网关多租户隔离键。正常情况下它已经通过
+        ``build_session_key()`` 嵌入 ``session_key``，这里仍然把它纳入
+        signature，是为了多加一层防御：运行中的 ``MemoryStore`` 会在 agent
+        构造时从当前 owner ContextVar 冻结 system-prompt memory snapshot。
+        如果 agent 被跨 owner 复用，就会复用到别人的冻结 memory snapshot。
         """
         import hashlib, json as _j
 
@@ -13615,6 +13622,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                str(owner_key or ""),
             ],
             sort_keys=True,
             default=str,
@@ -15516,6 +15524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cache_keys=self._extract_cache_busting_config(user_config),
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
+                owner_key=getattr(source, "owner_key", None),
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)

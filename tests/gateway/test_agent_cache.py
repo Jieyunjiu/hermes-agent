@@ -1529,6 +1529,21 @@ class TestAgentConfigSignatureUserId:
         )
         assert sig_a != sig_b
 
+    def test_signature_changes_with_owner_key(self):
+        """owner 不同必须重建 agent，避免复用别人的 frozen memory snapshot。"""
+        from gateway.run import GatewayRunner
+
+        runtime = {"provider": "anthropic", "api_key": "k", "base_url": "", "api_mode": "chat_completions"}
+        sig_a = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["wecom_multi_tenant"], "",
+            user_id="alice", owner_key="wecom:corp-a:app:alice",
+        )
+        sig_b = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4", runtime, ["wecom_multi_tenant"], "",
+            user_id="alice", owner_key="wecom:corp-b:app:alice",
+        )
+        assert sig_a != sig_b
+
     def test_signature_omits_user_id_when_absent(self):
         """Default-None user_id must not change signatures vs unset call.
 

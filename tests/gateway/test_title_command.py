@@ -15,13 +15,14 @@ from gateway.session import SessionSource
 
 
 def _make_event(text="/title", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890"):
+                user_id="12345", chat_id="67890", owner_key=None):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
         user_name="testuser",
+        owner_key=owner_key,
     )
     return MessageEvent(text=text, source=source)
 
@@ -68,6 +69,28 @@ class TestHandleTitleCommand:
 
         # Verify in DB
         assert db.get_session_title("test_session_123") == "My Research Project"
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_title_fallback_create_session_preserves_owner_key(self, tmp_path):
+        """兜底创建 session 时也必须写 owner_key，避免生成无 owner 的行。"""
+        from hermes_state import SessionDB
+
+        owner = "wecom:corp:app:alice"
+        db = SessionDB(db_path=tmp_path / "state.db")
+        runner = _make_runner(session_db=db)
+        event = _make_event(
+            text="/title Owner Session",
+            platform=Platform.WECOM,
+            user_id="alice",
+            chat_id="alice",
+            owner_key=owner,
+        )
+
+        result = await runner._handle_title_command(event)
+
+        assert "Owner Session" in result
+        assert db.get_session("test_session_123")["owner_key"] == owner
         db.close()
 
     @pytest.mark.asyncio
