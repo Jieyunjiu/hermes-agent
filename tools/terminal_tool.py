@@ -63,10 +63,24 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 from gateway.multi_tenant import (
     multi_tenant_enabled,
     sandbox_enabled,
+    sandbox_config,
     get_current_owner_key,
 )
 
+# 并发信号量：限制同时执行的 docker 命令数，容量来自 sandbox_config().max_concurrent（默认 24）
+_sandbox_semaphore = None
+_sandbox_semaphore_lock = threading.Lock()
 
+
+def _get_sandbox_semaphore(force_fresh: bool = False) -> threading.Semaphore:
+    """惰性初始化全局并发信号量，容量从 sandbox_config 读取。"""
+    global _sandbox_semaphore
+    if force_fresh or _sandbox_semaphore is None:
+        with _sandbox_semaphore_lock:
+            if force_fresh or _sandbox_semaphore is None:
+                cap = int(sandbox_config().get("max_concurrent", 24))
+                _sandbox_semaphore = threading.Semaphore(max(1, cap))
+    return _sandbox_semaphore
 
 
 # =============================================================================
@@ -2448,7 +2462,12 @@ def terminal_tool(
                             default_cwd=cwd,
                         ),
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    # 多租户 docker 模式：信号量限制同时执行数，只包"执行"段（不包建容器/空闲）
+                    if multi_tenant_enabled() and sandbox_enabled() and env_type == "docker":
+                        with _get_sandbox_semaphore():
+                            result = env.execute(command, **execute_kwargs)
+                    else:
+                        result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
