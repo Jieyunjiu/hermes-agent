@@ -265,6 +265,13 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     p = Path(_expand_tilde(filepath))
     multi_tenant_root = _multi_tenant_workspace_root()
     if multi_tenant_root is not None:
+        raw = str(p)
+        # /workspace 是容器内视角的别名，确定性映射到宿主机的 owner_root。
+        # 先归一化，再交给下游 _validate_multi_tenant_workspace_path 做越界校验。
+        # （不用 try-fail-guess：只要路径前缀匹配就映射，绝不猜测。）
+        if raw == "/workspace" or raw.startswith("/workspace/"):
+            rel = raw[len("/workspace"):].lstrip("/")
+            return (multi_tenant_root / rel).resolve()
         if p.is_absolute():
             return p.resolve()
         # 多租户模式下，相对路径不再跟随终端 cwd，而是固定落到当前
