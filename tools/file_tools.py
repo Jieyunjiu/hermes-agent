@@ -795,6 +795,14 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     parent's container and its cached file_ops. RL/benchmark task_ids with
     a registered env override keep their isolation.
     """
+    # 多租户 A 方案：进程内直接读写 owner_root，不建 docker 容器（R3#5 / §9.8c(a)）。
+    # 必须在 from tools.terminal_tool import _create_environment 之前 return，
+    # 确保 docker/singularity/modal 等后端完全不被触碰。
+    _mt_root = _multi_tenant_workspace_root()
+    if _mt_root is not None:
+        from tools.environments.local import LocalEnvironment
+        return ShellFileOperations(LocalEnvironment(cwd=str(_mt_root)))
+
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
