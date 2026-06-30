@@ -1898,6 +1898,22 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     )
 
 
+def _to_workspace_view(host_path: str, owner_root) -> "str | None":
+    """将宿主机绝对路径转换为模型可见的 /workspace/... 视图（Task 12）。
+
+    仅在多租户模式下呈现给模型，内部代码仍用宿主机真实路径。
+
+    - host_path 在 owner_root 目录内 → 返回 /workspace/<rel>
+    - 越界（不在 owner_root 内）→ 返回 None（fail-closed，R3#3：绝不回传宿主机路径）
+    """
+    from pathlib import Path as _P
+    try:
+        rel = _P(host_path).resolve().relative_to(_P(owner_root).resolve())
+    except ValueError:
+        return None  # 越界：fail-closed，绝不回传宿主机路径（R3#3）
+    return "/workspace/" + str(rel)
+
+
 def _format_duration(seconds: float) -> str:
     total = int(round(seconds))
     if total < 0:
@@ -8757,10 +8773,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 display_name = parts[2] if len(parts) >= 3 else basename
                 display_name = re.sub(r'[^\w.\- ]', '_', display_name)
 
-                # Translate host cache path to in-container path if running under Docker backend.
-                # This ensures the agent receives a path it can open inside its sandbox, as the
-                # cache directories are auto-mounted at /root/.hermes/cache/* by get_cache_directory_mounts().
-                agent_path = to_agent_visible_cache_path(path)
+                # 多租户模式：将宿主机路径转换为模型可见的 /workspace/... 视图（Task 12）。
+                # fail-closed（R3#3）：越界路径返回 None，此时跳过该 note，绝不 fallback 到
+                # to_agent_visible_cache_path（它在非 docker/未命中 cache 挂载时会原样回传宿主机路径）。
+                # 单用户模式：沿用原有 to_agent_visible_cache_path 逻辑，行为不变。
+                from gateway.multi_tenant import (
+                    multi_tenant_enabled as _mt_enabled,
+                    get_current_owner_key as _get_owner_key,
+                    owner_workspace_root as _owner_workspace_root,
+                )
+                if _mt_enabled():
+                    try:
+                        _ok = _get_owner_key()
+                        _workspace_path = _to_workspace_view(path, _owner_workspace_root(_ok))
+                    except Exception:
+                        _workspace_path = None
+                    if _workspace_path is None:
+                        # 越界或缺少 owner_key：跳过该 note（fail-closed，不泄漏宿主机路径）
+                        continue
+                    agent_path = _workspace_path
+                else:
+                    # Translate host cache path to in-container path if running under Docker backend.
+                    # This ensures the agent receives a path it can open inside its sandbox, as the
+                    # cache directories are auto-mounted at /root/.hermes/cache/* by get_cache_directory_mounts().
+                    agent_path = to_agent_visible_cache_path(path)
 
                 context_note = _build_document_context_note(display_name, agent_path, mtype)
                 message_text = f"{context_note}\n\n{message_text}"
