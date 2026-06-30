@@ -60,6 +60,7 @@ MULTI_TENANT_RELOAD_DENIED = (
 
 
 _WECOM_MULTI_TENANT_TOOLSET = "wecom_multi_tenant"
+_WECOM_MULTI_TENANT_SANDBOX_TOOLSET = "wecom_multi_tenant_sandbox"
 
 # ---------------------------------------------------------------------------
 # ContextVar: the per-request owner key (必改 2 — injected via copy_context)
@@ -234,14 +235,17 @@ def constrain_toolsets_for_owner(
 
     多租户阶段 1 的目标是先把安全边界闭环，而不是继承个人助手的完整工具面。
     因此一旦当前消息带有 owner_key，就不再相信平台配置、MCP 动态刷新或
-    plugin toolset 注入出来的工具列表，而是强制收敛到一个固定 allowlist：
-    ``wecom_multi_tenant``。这个 toolset 不包含 terminal/process/execute_code/
+    plugin toolset 注入出来的工具列表，而是强制收敛到一个固定 allowlist。
+    当 sandbox.enabled=true 时用 ``wecom_multi_tenant_sandbox``（带 terminal）；
+    否则用 ``wecom_multi_tenant``（纯受限）。这些 toolset 不包含 execute_code/
     delegate_task/skill_manage/cronjob/browser/computer_use 等高风险工具。
 
     ``disabled_toolsets`` 在这里清空，是因为 allowlist 本身已经是最终工具面；
     再叠加旧的禁用项可能把必需的 memory/session/file 工具误删。
     """
     if multi_tenant_enabled() and owner_key:
+        if sandbox_enabled():
+            return [_WECOM_MULTI_TENANT_SANDBOX_TOOLSET], None
         return [_WECOM_MULTI_TENANT_TOOLSET], None
     return enabled_toolsets, disabled_toolsets
 
