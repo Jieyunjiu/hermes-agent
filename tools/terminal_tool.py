@@ -1906,6 +1906,16 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        # 多租户 sandbox 禁后台进程（T6）：background / notify_on_complete / watch_patterns 不支持
+        # 这些功能依赖 process_registry owner 隔离，尚未在第一阶段实现，所以在多租户 sandbox 下拒绝。
+        if multi_tenant_enabled() and sandbox_enabled() and (background or notify_on_complete or watch_patterns):
+            return json.dumps({
+                "error": "background processes are disabled in multi-tenant sandbox mode. "
+                         "Run in the foreground with a higher timeout instead "
+                         "(commands return as soon as they finish).",
+                "status": "error",
+            }, ensure_ascii=False)
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
