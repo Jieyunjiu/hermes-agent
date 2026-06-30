@@ -564,6 +564,29 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "wecom_multi_tenant_sandbox": {
+        "description": (
+            "WeCom multi-tenant sandbox toolset: 受限集 + terminal"
+            "（owner 专属 docker 沙箱执行）"
+        ),
+        "tools": [
+            "web_search",
+            "web_extract",
+            "read_file",
+            "write_file",
+            "patch",
+            "search_files",
+            "skills_list",
+            "skill_view",
+            "todo",
+            "memory",
+            "session_search",
+            "clarify",
+            "terminal",
+        ],
+        "includes": [],
+    },
+
     "hermes-yuanbao": {
         "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情",
         "tools": _HERMES_CORE_TOOLS + [
