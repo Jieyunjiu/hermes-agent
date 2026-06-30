@@ -58,6 +58,14 @@ logger = logging.getLogger(__name__)
 from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — re-exported
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 
+# 多租户 sandbox 守卫所需函数（模块级 import，让测试可 patch tools.terminal_tool.*，
+# 同时满足 T6/T13 的 patch 前置条件——见 R3#7）
+from gateway.multi_tenant import (
+    multi_tenant_enabled,
+    sandbox_enabled,
+    get_current_owner_key,
+)
+
 
 
 
@@ -1918,6 +1926,16 @@ def terminal_tool(
         # 多租户 owner override 可改写后端类型（R1#1）
         if overrides.get("env_type"):
             env_type = overrides["env_type"]
+
+        # fail-closed：多租户 sandbox 模式下必须 docker，绝不退化 local（§6.1）
+        # env_type 在此处已最终确定（config → override），环境尚未创建，拦截所有非 docker 路径。
+        if multi_tenant_enabled() and sandbox_enabled() and env_type != "docker":
+            return json.dumps({
+                "error": "refused: multi-tenant sandbox requires a docker environment "
+                         "but none was resolved (owner sandbox override missing). "
+                         "Execution is blocked to avoid running on the host.",
+                "status": "error",
+            }, ensure_ascii=False)
 
         # Select image based on env type, with per-task override support
         if env_type == "docker":
