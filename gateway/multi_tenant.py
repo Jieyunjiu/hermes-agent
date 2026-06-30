@@ -251,6 +251,17 @@ def dynamic_reload_denied_message() -> str:
     return MULTI_TENANT_RELOAD_DENIED
 
 
+def sandbox_config() -> dict:
+    """返回 security.multi_tenant.sandbox 配置块（缺失返回空 dict）。"""
+    sb = _config_multi_tenant().get("sandbox", {}) or {}
+    return sb if isinstance(sb, dict) else {}
+
+
+def sandbox_enabled() -> bool:
+    """多租户开启 且 sandbox.enabled=true 才为真。"""
+    return bool(multi_tenant_enabled() and sandbox_config().get("enabled", False))
+
+
 # ---------------------------------------------------------------------------
 # Workspace root for an owner (必改 7 & 8 share this anchor)
 # ---------------------------------------------------------------------------
