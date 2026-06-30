@@ -41,6 +41,7 @@ from agent.prompt_builder import (
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    build_capability_manifest,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -380,6 +381,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             f"refuse such writes by default; pass cross_profile=True only "
             f"after explicit direction."
         )
+
+    # 多租户沙箱能力清单（防幻觉）——工具集在 session 启动时已确定，
+    # enabled_toolsets 全程不变，放入 stable 段不破缓存。
+    _enabled_toolsets = getattr(agent, "enabled_toolsets", None) or []
+    if "wecom_multi_tenant_sandbox" in _enabled_toolsets:
+        stable_parts.append(build_capability_manifest())
 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply

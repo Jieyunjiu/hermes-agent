@@ -1886,3 +1886,20 @@ def build_context_files_prompt(
     if not sections:
         return ""
     return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+
+
+def build_capability_manifest() -> str:
+    """返回多租户沙箱的静态能力清单（防幻觉锚点）。
+
+    纯函数，返回固定文本，两次调用结果完全相同——适合拼进 system prompt
+    的 stable 段而不破坏 prompt 缓存。
+    """
+    return (
+        "# 你的执行环境（多租户沙箱）\n"
+        "- 你的 shell 运行在一个隔离沙箱里，只挂载了当前用户的工作区 /workspace；"
+        "你无法访问宿主机或其他用户的数据。\n"
+        "- 沙箱默认无网络。需要联网检索请用 web_search / web_extract 工具。\n"
+        "- 用户上传的文件在 /workspace/uploads/ 下。\n"
+        "- 你的能力仅限工具 schema 中列出的那些；schema 里没有的能力你就是没有，"
+        "不要声称或暗示你拥有它。不确定时先检查你的工具，不要假设。\n"
+    )
