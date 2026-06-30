@@ -531,6 +531,11 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        # 多租户挂载开关：默认全开，保持单用户旧行为不变。
+        # 多租户模式下可按需关闭 credentials/cache 自动挂载，避免跨租户泄漏。
+        mount_credentials: bool = True,
+        mount_skills: bool = True,
+        mount_cache: bool = True,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -538,6 +543,9 @@ class DockerEnvironment(BaseEnvironment):
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
         self._task_id = task_id
+        self._mount_credentials = mount_credentials
+        self._mount_skills = mount_skills
+        self._mount_cache = mount_cache
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._container_id: Optional[str] = None
@@ -645,74 +653,77 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
-                src = Path(mount_entry["host_path"])
-                if src.is_dir():
-                    # Docker-in-Docker: Docker auto-created the source path as
-                    # a directory when it didn't exist on the host.  Mounting a
-                    # directory over a file destination causes exit 125.
-                    logger.warning(
-                        "Docker: skipping credential mount — source is a directory "
-                        "(likely Docker-in-Docker auto-creation): %s",
-                        src,
+            if self._mount_credentials:
+                for mount_entry in get_credential_file_mounts():
+                    src = Path(mount_entry["host_path"])
+                    if src.is_dir():
+                        # Docker-in-Docker: Docker auto-created the source path as
+                        # a directory when it didn't exist on the host.  Mounting a
+                        # directory over a file destination causes exit 125.
+                        logger.warning(
+                            "Docker: skipping credential mount — source is a directory "
+                            "(likely Docker-in-Docker auto-creation): %s",
+                            src,
+                        )
+                        continue
+                    if not src.is_file():
+                        logger.warning(
+                            "Docker: skipping credential mount — source not found: %s", src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting credential %s -> %s",
+                        mount_entry["host_path"],
+                        mount_entry["container_path"],
                     )
-                    continue
-                if not src.is_file():
-                    logger.warning(
-                        "Docker: skipping credential mount — source not found: %s", src,
-                    )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting credential %s -> %s",
-                    mount_entry["host_path"],
-                    mount_entry["container_path"],
-                )
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
-                src = Path(skills_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping skills mount — source is not a directory: %s",
-                        src,
+            if self._mount_skills:
+                for skills_mount in get_skills_directory_mount():
+                    src = Path(skills_mount["host_path"])
+                    if not src.is_dir():
+                        logger.warning(
+                            "Docker: skipping skills mount — source is not a directory: %s",
+                            src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting skills dir %s -> %s",
+                        skills_mount["host_path"],
+                        skills_mount["container_path"],
                     )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting skills dir %s -> %s",
-                    skills_mount["host_path"],
-                    skills_mount["container_path"],
-                )
 
             # Mount host-side cache directories (documents, images, audio,
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
-                src = Path(cache_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping cache mount — source is not a directory: %s",
-                        src,
+            if self._mount_cache:
+                for cache_mount in get_cache_directory_mounts():
+                    src = Path(cache_mount["host_path"])
+                    if not src.is_dir():
+                        logger.warning(
+                            "Docker: skipping cache mount — source is not a directory: %s",
+                            src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting cache dir %s -> %s",
+                        cache_mount["host_path"],
+                        cache_mount["container_path"],
                     )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting cache dir %s -> %s",
-                    cache_mount["host_path"],
-                    cache_mount["container_path"],
-                )
         except Exception as e:
             logger.debug("Docker: could not load credential file mounts: %s", e)
 
