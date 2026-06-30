@@ -333,3 +333,35 @@ def assert_session_owner(db, session_id: str, owner_key: str) -> Optional[str]:
         # Same message as the not-found branch: anti-enumeration.
         return f"session not found: {session_id}"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Sandbox override builder for owner-scoped isolation (必改 5 & 6)
+# ---------------------------------------------------------------------------
+
+def build_owner_sandbox_overrides(owner_key: str) -> dict:
+    """owner_key → 一份钉死的 docker 沙箱 override（供 register_task_env_overrides）。
+
+    所有隔离/加固选项在这里集中设死，调用方不再散落配置。
+    """
+    sb = sandbox_config()
+    root = owner_workspace_root(owner_key)
+    # 审查 R3#2：owner workspace 目录必须先存在，否则 docker.py:597 的 isdir 检查
+    # 不通过 → host_cwd 不挂到 /workspace → 退回 sandbox 临时目录（隔离失效）。
+    root.mkdir(parents=True, exist_ok=True)
+    return {
+        "env_type": "docker",
+        "docker_image": sb.get("image", ""),
+        "host_cwd": str(root),
+        "docker_mount_cwd_to_workspace": True,   # 没这个 host_cwd 不会挂到 /workspace
+        "cwd": "/workspace",
+        "network": False,                         # 默认禁网
+        "docker_volumes": [],                     # 丢弃 operator 任意 volumes
+        "container_persistent": True,             # 进程内复用
+        "docker_persist_across_processes": False, # 关跨进程复用
+        "mount_credentials": False,               # 全局凭证绝不进容器
+        "mount_skills": True,                      # 公共业务 skills（RO）保留
+        "mount_cache": False,                      # 全局 cache 含他人上传，关
+        "container_cpu": int(sb.get("cpus", 2)),
+        "container_memory": int(sb.get("memory_mb", 4096)),
+    }
