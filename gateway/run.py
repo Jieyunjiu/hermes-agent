@@ -16054,6 +16054,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            # 放在 try 外侧，确保 finally 里的清理逻辑无论何时执行都能读到该标志
+            _sandbox_registered = False
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -16100,6 +16102,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_message"] = message
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                # 多租户 sandbox：为本次对话注册 owner 专属 docker 沙箱 override
+                # 注册键 = session_id（与传给 run_conversation 的 task_id 一致，R3#1）
+                try:
+                    from gateway.multi_tenant import sandbox_enabled, build_owner_sandbox_overrides, get_current_owner_key
+                    from tools.terminal_tool import register_task_env_overrides
+                    _ok = get_current_owner_key()  # 当前 owner（ContextVar，已在上游 set）
+                    if _ok and sandbox_enabled():
+                        register_task_env_overrides(session_id, build_owner_sandbox_overrides(_ok))
+                        _sandbox_registered = True
+                except Exception:
+                    logger.exception("failed to register owner sandbox overrides")  # 工具侧 fail-closed 会兜
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
@@ -16112,6 +16125,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+                # 清理 owner sandbox override（try/finally 保证即使 run_conversation 抛异常也执行）
+                if _sandbox_registered:
+                    try:
+                        from tools.terminal_tool import clear_task_env_overrides
+                        clear_task_env_overrides(session_id)
+                    except Exception:
+                        logger.exception("failed to clear owner sandbox overrides")
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
