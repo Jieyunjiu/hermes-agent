@@ -1951,15 +1951,17 @@ def terminal_tool(
         if overrides.get("env_type"):
             env_type = overrides["env_type"]
 
-        # fail-closed：多租户 sandbox 模式下必须 docker，绝不退化 local（§6.1）
-        # env_type 在此处已最终确定（config → override），环境尚未创建，拦截所有非 docker 路径。
-        if multi_tenant_enabled() and sandbox_enabled() and env_type != "docker":
-            return json.dumps({
-                "error": "refused: multi-tenant sandbox requires a docker environment "
-                         "but none was resolved (owner sandbox override missing). "
-                         "Execution is blocked to avoid running on the host.",
-                "status": "error",
-            }, ensure_ascii=False)
+        # fail-closed：多租户 sandbox 模式下，env_type 必须来自 owner override（非全局配置）。
+        # 即使全局 TERMINAL_ENV=docker，若 overrides 中没有 env_type=docker，
+        # 也必须拒绝——全局 docker 容器不是 owner 绑定的容器，属于隔离泄漏（§6.1）。
+        if multi_tenant_enabled() and sandbox_enabled():
+            if overrides.get("env_type") != "docker":
+                return json.dumps({
+                    "error": "refused: multi-tenant sandbox requires an owner docker override, "
+                             "but none was resolved for this session. Execution blocked to avoid "
+                             "running on the host or in a non-owner container.",
+                    "status": "error",
+                }, ensure_ascii=False)
 
         # Select image based on env type, with per-task override support
         if env_type == "docker":
