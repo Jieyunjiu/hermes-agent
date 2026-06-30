@@ -1,6 +1,6 @@
 # 多租户企业微信 · 沙箱执行能力恢复方案（设计 spec）
 
-> 状态：待审核（草案 v4，含两轮代码审查 + 一轮设计细化，见 §14）
+> 状态：待审核（草案 v6，含四轮审查 + 一轮设计细化 + 会话重置策略，见 §14）
 > 日期：2026-06-29
 > 关联文档：`study/multi-tenant-wecom-rebuild-plan.md`（多租户主方案）、`study/hermes-agent-architecture-analysis.md`、`study/summary/tool-calling-and-injection-engineering-notes.md`
 > 本文只覆盖"在多租户模式下，安全地把执行类能力（一期：`terminal`）还给智能体"这一件事。
@@ -151,13 +151,15 @@ Hermes 已内置可插拔执行环境抽象 `tools/environments/`，关键能力
 ### 5.3 task_id 与隔离键（硬不变量）
 
 - 环境复用按 `task_id` 缓存（`_active_environments`）。**task_id 必须按 owner 唯一**，否则两个 owner 命中同一缓存容器 = 跨租户泄漏。
-- **已定（容器粒度 = 每 owner 一个）**：`task_id = hash_owner_key(owner)`。同一 owner 的所有 session 共用一个容器、共享同一 owner workspace；跨 owner 不同 hash → 不同容器，隔离不变。
-  - 为什么不是 per-session：安全/文件连续性/依赖三方面 per-session 与 per-owner **完全等价**（都 owner 级隔离、共享 workspace、同镜像）；per-owner 更省（同 owner 切 session 复用热容器、免冷启动），且更贴合现有 `_resolve_container_task_id` 把"每会话表面"塌缩为共享容器的取向。
+- **已定（容器粒度 = 每 session 一个；workspace 按 owner 共享）**：override **注册在该请求实际的 `task_id`（即 `session_id`，见 `gateway/run.py:16094` 传 `task_id=session_id`）下**，与 terminal/file 工具运行时收到的 task_id 对齐——否则 `resolve_task_overrides` 读不到（审查 R3#1）。
+  - **关键解耦**：`workspace 按 owner 共享`与`容器按 session 走`是两件事。容器 bind-mount 的目录始终是 `owner_workspace_root(owner_key)`（来自 owner ContextVar，**与 task_id 无关**）。所以哪怕每个 session 各起一个容器，挂的都是**同一个 owner workspace** → 文件跨 session 共享、持久。"共享 workspace"不需要"共享容器"。
+  - **为什么不用 `task_id=hash_owner_key`（放弃 per-owner 容器）**：`task_id` 在本项目里**不只键控容器**，还键控**缓存的 AIAgent 实例、terminal 沙箱、browser daemon、bg 进程**（`gateway/run.py:13900/13981`：同 task_id 的下一个 agent 会继承这些）。若把 task_id 改成 owner hash，同 owner 多 session 会塌缩到同一 agent 实例，违背代码库"task_id = 一个对话"的核心假设，爆炸半径大。改用 session 级 task_id 不碰这个假设，最小风险。
+  - **运营假设下二者等价**：业务用户"同一时间只有一个 session、做完即开新（老 agent 由 `/new` 硬销毁 `_cleanup_agent_resources`）"，所以 per-session 容器实践中就等于 per-owner，不会堆积。
   - **容器内路径**：bind-mount 是 `owner_workspace_root(owner)` → `/workspace`；hash 只在宿主机路径里，容器内统一是 `/workspace`（不出现 hash）。隔离靠"该容器只挂了这个 owner 的目录"，不靠容器内路径名。
-  - **已知小代价（非安全问题）**：同一 owner 若**并发**在多 session 发命令，会进同一容器，可能在 shell 状态（cwd/env）上互串。同人同数据、不涉越权，最坏是工作目录混淆。可选兜底：加**每 owner 串行锁**让同 owner 命令排队（见开放项；默认不加，按需开启）。
 - spec 要求：
-  1. 注入 override 时写一条断言：该 task_id（owner hash）当前若已绑定到别的 owner_key，必须拒绝（防串号；正常不会发生，做防御）。
+  1. override 在请求处理链里**用与 `run_conversation` 相同的 `task_id`（session_id）注册**；该 session 本就是当前 owner 新建的，天然 owner-bound（无需额外串号断言，但容器挂载目录由 owner ContextVar 派生，跨 owner 自然隔离）。
   2. `owner_workspace_root` 路径来自 `hash_owner_key`（sha256 前 16 位），天然 path-safe，不接受模型输入。
+  3. owner workspace 目录必须在建容器前**已存在**（`docker.py:597` 要求 `isdir(host_cwd)` 才挂）——由 `build_owner_sandbox_overrides` 负责 `mkdir(parents=True, exist_ok=True)`（审查 R3#2）。
 
 > **【审查修订 #4，P1】跨进程容器复用只比 label，不比 mounts，必须关掉。**
 > `DockerEnvironment` 的跨进程复用（`docker.py:823-828` 注释明示）**只按 `hermes-task-id` + `hermes-profile` label 匹配，故意不比较 image / mounts / resources**。多租户下若一个 stale 容器挂着旧的 owner workspace，仅凭 task_id 命中就被复用 = 挂错目录的隔离事故。
@@ -387,6 +389,21 @@ security:
 - 镜像构建：仓库内提供 Dockerfile（源码部署到服务器时构建一次），**预装全部运行期依赖**（因默认禁网，运行期无法 pip install，见审查 R2#4）。
 - 不复用 `TERMINAL_DOCKER_*` 全局环境变量做 owner 配置——owner 配置只走 `register_task_env_overrides`，与全局解耦。
 
+### 8.1 会话重置策略（session 永久打开，除非手动 /new）
+
+**已定**：本部署要求 session **不自动重置**，只有用户手动 `/new`（或 `/reset`）才结束。需把会话重置策略关掉（默认是"凌晨 4 点 + 24h 无活动"自动重置）：
+
+```yaml
+# config.yaml 网关配置（与 sandbox 无关，是 session 生命周期）
+default_reset_policy:
+  mode: none        # 永不自动重置；仅 /new、/reset 触发（reset_triggers 默认含这两个）
+# 如只想对企业微信平台关闭、其它平台保留默认，可改用 per-platform 的 reset_policy
+```
+
+- 对应代码：`SessionResetPolicy`（`gateway/config.py:275`，默认 `mode="both", at_hour=4, idle_minutes=1440`）；`mode="none"` 即"永不自动重置"（`session.py:_is_session_expired` 在 `policy.mode=="none"` 时直接返回 False）。
+- **三个时钟仍各自独立**（见 §5.5/§5.4）：把 session 设为永不自动重置，**不影响**容器仍按 ~300s 空闲回收、workspace 仍按 owner 永久持久。即"窗口一直开着也允许，但闲置容器照样回收、下次发命令再建"。
+- **副作用提醒**：`mode="none"` 下会话历史会一直累积到用户 `/new`——这与 §13 #11（workspace/历史保留）+ #12（new-only/删旧 session 设想）强相关：要靠"做完即 /new + 清理"控制历史磁盘增长。
+
 ---
 
 ## 9. 改动清单（文件级，最小 diff）
@@ -468,7 +485,7 @@ security:
 4. **skills 进沙箱**：✅ 中央开发、公共共享、带可执行脚本 → **保留 RO 全局挂载**。配套纪律：skill 脚本内不得硬编码密钥。（若未来引入用户私有 skill，需改"公共 RO + 私有 owner-scoped"，届时另议。）
 5. **上传文件进沙箱**：✅ **已实现，无需额外挂载/拷贝**。多租户下企业微信入站文件已写入 `owner_workspace_root(owner)/uploads/<upload_id>/<file>`（`adapter.py` 的 `_cache_owner_upload`，含 `validate_within_dir` 防越界）；沙箱挂的就是 owner workspace，故 `/workspace/uploads/...` 天然可见。
    - **唯一待处理细节（路径翻译）**：`_cache_owner_upload` 返回给模型的是**宿主机绝对路径**（`/data/workspaces/<hash>/uploads/...`），但容器内同一文件在 `/workspace/uploads/...`。**实施时必须把交给模型的路径翻译成容器内路径**（或 workspace 相对路径），否则模型在沙箱里按宿主机路径打不开文件。列为一期实现项。
-6. **task_id 来源 / 容器粒度**：✅ **每 owner 一个容器**，`task_id = hash_owner_key(owner)`，同 owner 多 session 共用、共享 workspace（详见 §5.3）。
+6. **task_id 来源 / 容器粒度**：✅ **每 session 一个容器**（override 注册在实际 `task_id=session_id` 下，与 terminal 收到的对齐）；**workspace 按 owner 共享**（与容器解耦）。运营假设"一用户一时刻一 session、老的硬销毁"下，per-session 实践即 per-owner。**不**改 task_id 全局语义（它还键控 AIAgent 实例缓存）。详见 §5.3（审查 R3#1 修正）。
 7. **资源默认值**：✅ 部署于 128c/192G、~100 在线。单容器 cpu=2 / memory=4096MB，全局 `max_concurrent=24`（峰值约占一半，留足余量），空闲回收 300s（详见 §8）。压测后可上调并发到 32。
 
 8. **每 owner 串行锁**：✅ **不加**。主要依据：用户为业务同事，几乎不会"开新窗口并发任务再 resume 回来"，同 owner 并发多 session 属极低概率。即便偶发也只影响 shell 状态、非安全。如未来实测出现并发问题再加。
@@ -478,7 +495,7 @@ security:
 ### 相关但在本 spec 之外（需单独跟踪）
 
 11. **workspace 保留/清理策略**：删 session 只清 DB 会话历史，**不清 owner workspace 磁盘文件**（`uploads/` 每个上传文件 + 中间产物随用持续增长，且 workspace 与 session 解耦——这正是"长期项目文件放 workspace、新 session 直接读"能成立的原因）。若在意长期存储膨胀，需为 workspace 设独立保留策略（如 uploads 超期清理 / 培训用户自清）。**本 spec 不实现，仅记录。**
-12. **new/resume 会话命令调整（未来设想，当前版本不做）**：曾讨论过"砍掉 resume、只留 new + 做完即删旧 session"来控制会话历史增长、长期任务靠 workspace 项目文件延续。**这只是未来设想，需考察业务部门实际需求后再决定，当前版本不改动现有 new/resume 行为。** 本沙箱 spec 不依赖该调整——无论是否保留 resume，沙箱设计都成立（per-owner 容器 + owner workspace 与 session 解耦的事实不变）。
+12. **new/resume 会话命令调整（未来设想，当前版本不做）**：曾讨论过"砍掉 resume、只留 new + 做完即删旧 session"来控制会话历史增长、长期任务靠 workspace 项目文件延续。**这只是未来设想，需考察业务部门实际需求后再决定，当前版本不改动现有 new/resume 行为。** 本沙箱 spec 不依赖该调整——无论是否保留 resume，沙箱设计都成立（per-session 容器 + owner workspace 与 session 解耦的事实不变）。
 13. **分段并行调度（未来优化，本 spec 之外，需单独立项）**：当前"批次含 terminal → 整批串行"是保守安全选择。曾设想按串行工具为屏障把批次切成"并行段—串行点—并行段"逐段执行，提升含 terminal 批次的并行度。评估结论：**不在本 spec 做**——这是改核心调度器（全平台爆炸半径，违背窄腰铁律单独立项门槛）、对企业微信工作负载收益边际、且给安全关键路径加复杂度；YAGNI，待实测确认批次串行是真实瓶颈再单独立项 + 全平台回归。仅记录设想。
 
 ---
@@ -523,3 +540,28 @@ security:
 | 路径词汇统一 | `/workspace` 作为 `owner_workspace_root` 别名；确定性归一化 → 单点 `validate_within_dir`（不 try-fail-guess）；统一替代上传文件路径翻译 | §5.5.3、§9.8b/9.13 |
 | file 工具 fail-closed | terminal "非 docker 即拒"；file 工具 "非 owner 根内即拒"，两路径无缺口 | §6.1 |
 | 业务能力形态 | 业务流程做 **skill**（+脚本，bash 在沙箱跑）；file 工具只留通用原语，不为业务流程加 model-tool（守窄腰） | §13 已决 #10 |
+
+### 14.4 第四轮（审计划，plan v1 → v2）
+
+针对实施计划 `study/execute-plans/2026-06-30-multi-tenant-sandbox-exec-plan.md` 的审查，7 条全部核实**成立**，已修正计划（部分回写本 spec）：
+
+| # | 级别 | 问题 | 代码证据 | 处置 |
+|---|---|---|---|---|
+| R3#1 | P0 | task_id 不闭环：override 注册键 `hash_owner_key` ≠ 主流程传的 `task_id=session_id` | `run.py:16094` | **每 session 一容器**：override 注册在 session_id 下；不改 task_id 全局语义（它还键控 AIAgent 缓存）。§5.3 修正；plan T11 |
+| R3#2 | P0 | owner workspace 目录可能不存在 → docker 不挂、退回 sandbox 临时目录 | `docker.py:597` | `build_owner_sandbox_overrides` 里 `mkdir(parents=True, exist_ok=True)`。§5.3 要求#3；plan T2 |
+| R3#3 | P1 | 上传路径不应在 adapter 层整体改 `/workspace`（内部还要用真实路径）；越界须 fail-closed | `adapter.py:773`、`run.py:8734/8736`（已有 `to_agent_visible_cache_path`） | 仅在"展示给模型"处（`run.py:8734`）转换，复用现成接缝；`_to_workspace_view` 越界拒绝不回传宿主机路径。plan T12 |
+| R3#4 | P1 | system prompt 组装入口在 `system_prompt.py:113`，非 prompt_builder | `system_prompt.py:113` | 文本可放 prompt_builder，注入在 `build_system_prompt_parts` 的 stable 段，测最终 prompt。plan T14 |
+| R3#5 | P1 | T8 验收/实现不一致；read_file 实走 `_get_file_ops` | `file_tools.py:1070` | 目标明确为"多租户下不创建 docker 容器"，改 `_get_file_ops` 环境选择，测 `env_type=docker` 断言不建容器。plan T8 |
+| R3#6 | P2 | 信号量测试只查 `_value`，证明不了包裹执行 | — | 补行为测试（伪造 semaphore 断言进入/退出）。plan T13 |
+| R3#7 | P2 | 测试 patch `tools.terminal_tool.multi_tenant_enabled` 但无该模块级符号 | `terminal_tool.py` 无此 import | 实现加模块级 import/wrapper（让 patch 目标成立），或测试改 patch `gateway.multi_tenant.*`。plan T5/T6 |
+
+### 14.5 第五轮（审计划 plan v2 → v3）
+
+4 条 plan-quality 修正（均落在实施计划，不改设计）：
+
+| # | 级别 | 问题 | 处置 |
+|---|---|---|---|
+| R4#1 | P0 | plan 顶部不变量 + 自检仍写 `task_id=hash_owner_key`，与 T11 的 session_id 矛盾 | 全篇统一"容器 per-session、workspace per-owner"（plan Global Constraints + 自检） |
+| R4#2 | P1 | T12 fail-closed 文案 fallback 到 `to_agent_visible_cache_path`（未命中会原样返回 host path，泄漏）；测试路径不一致 | None 时**跳过 note，不 fallback**；测试路径统一 `tests/gateway/`（`credential_files.py:403` 证据） |
+| R4#3 | P1 | T8 入口/patch 目标不可执行（真实入口 `read_file_tool`；`_create_environment` 在 `_get_file_ops` 内从 `tools.terminal_tool` 局部 import） | T8 改为 `_get_file_ops` 多租户分支直接构造进程内 file ops；测试 patch `tools.terminal_tool._create_environment`、入口 `read_file_tool`（`file_tools.py:1069/791`） |
+| R4#4 | P2 | T1 patch `_load_config` 与源码不符；T3 用假路径会被 `is_file/is_dir` 跳过 | T1 patch `_config_multi_tenant`；T3 用 `tmp_path` 真实文件/目录（`multi_tenant.py:121`、`docker.py:648`） |
