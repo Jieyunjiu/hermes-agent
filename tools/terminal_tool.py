@@ -1277,6 +1277,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            network=cc.get("network", True),               # R2 连带：透传 network
+            mount_credentials=cc.get("mount_credentials", True),
+            mount_skills=cc.get("mount_skills", True),
+            mount_cache=cc.get("mount_cache", True),
         )
     
     elif env_type == "singularity":
@@ -1911,7 +1915,10 @@ def terminal_tool(
         # ``"default"``) is still found under its originating session id while
         # isolation-keyed RL/benchmark overrides keep resolving as before.
         overrides = resolve_task_overrides(task_id)
-        
+        # 多租户 owner override 可改写后端类型（R1#1）
+        if overrides.get("env_type"):
+            env_type = overrides["env_type"]
+
         # Select image based on env type, with per-task override support
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -2012,19 +2019,26 @@ def terminal_tool(
                         container_config = None
                         if env_type in {"docker", "singularity", "modal", "daytona"}:
                             container_config = {
-                                "container_cpu": config.get("container_cpu", 1),
-                                "container_memory": config.get("container_memory", 5120),
+                                "container_cpu": overrides.get("container_cpu", config.get("container_cpu", 1)),
+                                "container_memory": overrides.get("container_memory", config.get("container_memory", 5120)),
                                 "container_disk": config.get("container_disk", 51200),
-                                "container_persistent": config.get("container_persistent", True),
+                                "container_persistent": overrides.get("container_persistent", config.get("container_persistent", True)),
                                 "modal_mode": config.get("modal_mode", "auto"),
-                                "docker_volumes": config.get("docker_volumes", []),
-                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                                "docker_volumes": overrides.get("docker_volumes", config.get("docker_volumes", [])),
+                                "docker_mount_cwd_to_workspace": overrides.get("docker_mount_cwd_to_workspace",
+                                                                               config.get("docker_mount_cwd_to_workspace", False)),
                                 "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                                 "docker_extra_args": config.get("docker_extra_args", []),
-                                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                                "docker_persist_across_processes": overrides.get("docker_persist_across_processes",
+                                                                                 config.get("docker_persist_across_processes", True)),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                # 新增：网络与挂载开关（R2 连带），override 优先，无 override 保持默认开启
+                                "network": overrides.get("network", True),
+                                "mount_credentials": overrides.get("mount_credentials", True),
+                                "mount_skills": overrides.get("mount_skills", True),
+                                "mount_cache": overrides.get("mount_cache", True),
                             }
 
                         local_config = None
@@ -2042,7 +2056,7 @@ def terminal_tool(
                             container_config=container_config,
                             local_config=local_config,
                             task_id=effective_task_id,
-                            host_cwd=config.get("host_cwd"),
+                            host_cwd=overrides.get("host_cwd") or config.get("host_cwd"),
                         )
                     except ImportError as e:
                         return json.dumps({
