@@ -301,8 +301,8 @@ _COMMON_HELPERS = '''\
 
 def json_parse(text: str):
     """Parse JSON tolerant of control characters (strict=False).
-    Use this instead of json.loads() when parsing output from terminal()
-    or web_extract() that may contain raw tabs/newlines in strings."""
+    Use this instead of json.loads() when parsing RPC tool output that
+    may contain raw tabs/newlines in strings."""
     return json.loads(text, strict=False)
 
 
@@ -607,7 +607,7 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
+        _creation_locks, _creation_locks_lock,
         _resolve_container_task_id,
     )
 
@@ -632,8 +632,15 @@ def _get_or_create_env(task_id: str):
                 return _active_environments[effective_task_id], _get_env_config()["env_type"]
 
         config = _get_env_config()
-        env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        # 复用 Task 2 的共享 helper：owner override（多租户 sandbox 下由 owner 容器
+        # 绑定）驱动 env_type + 容器参数，而非全局 TERMINAL_ENV 配置；非多租户/无
+        # override 时原样退回全局 config，行为不变。确保 execute_code 与 terminal/
+        # file 落到同一个 owner 容器（P3 核心，见 task-3-brief.md）。
+        from tools.terminal_tool import resolve_task_overrides, apply_owner_override
+        overrides = resolve_task_overrides(effective_task_id)
+        env_type, container_config, host_cwd = apply_owner_override(
+            config["env_type"], config, overrides
+        )
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -647,17 +654,6 @@ def _get_or_create_env(task_id: str):
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
-
-        container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona"}:
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-            }
 
         ssh_config = None
         if env_type == "ssh":
@@ -686,7 +682,7 @@ def _get_or_create_env(task_id: str):
             container_config=container_config,
             local_config=local_config,
             task_id=effective_task_id,
-            host_cwd=config.get("host_cwd"),
+            host_cwd=host_cwd,
         )
 
         with _env_lock:
@@ -1100,6 +1096,21 @@ def execute_code(
 
     if not code or not code.strip():
         return tool_error("No code provided.")
+
+    # 多租户 sandbox fail-closed 守卫：早拒，避免进入下面的环境创建路径。
+    # 与 terminal_tool.py / file_tools.py 的同名守卫同源——override 缺
+    # env_type=docker 一律拒绝，绝不退回主机 local 或全局 docker（那不是
+    # owner 绑定的容器，属于隔离泄漏）。
+    from tools.terminal_tool import resolve_task_overrides
+    from gateway.multi_tenant import multi_tenant_enabled, sandbox_enabled
+    if multi_tenant_enabled() and sandbox_enabled():
+        if resolve_task_overrides(task_id or "default").get("env_type") != "docker":
+            return json.dumps({
+                "error": "refused: multi-tenant sandbox requires an owner docker override, "
+                         "but none was resolved for this session. execute_code blocked to "
+                         "avoid running on the host or in a non-owner container.",
+                "status": "error",
+            }, ensure_ascii=False)
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
