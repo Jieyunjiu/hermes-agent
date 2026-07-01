@@ -1101,10 +1101,13 @@ def execute_code(
     # 与 terminal_tool.py / file_tools.py 的同名守卫同源——override 缺
     # env_type=docker 一律拒绝，绝不退回主机 local 或全局 docker（那不是
     # owner 绑定的容器，属于隔离泄漏）。
+    # 守卫和下面的本地/远程分发判断共用同一份 overrides（只调用一次
+    # resolve_task_overrides），避免两处判断分叉出不一致的 env_type。
     from tools.terminal_tool import resolve_task_overrides
     from gateway.multi_tenant import multi_tenant_enabled, sandbox_enabled
+    _overrides = resolve_task_overrides(task_id or "default")
     if multi_tenant_enabled() and sandbox_enabled():
-        if resolve_task_overrides(task_id or "default").get("env_type") != "docker":
+        if _overrides.get("env_type") != "docker":
             return json.dumps({
                 "error": "refused: multi-tenant sandbox requires an owner docker override, "
                          "but none was resolved for this session. execute_code blocked to "
@@ -1115,6 +1118,17 @@ def execute_code(
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]
+    # Critical 修复：上面的守卫看的是 overrides 里的 env_type，但如果这里不
+    # 覆盖，env_type 仍然是全局 TERMINAL_ENV（默认 "local"）。运营方只开了
+    # 多租户 sandbox、全局 TERMINAL_ENV 保持默认 local（最常见配置）时，
+    # 守卫会放行（因为 overrides.env_type == "docker"），但下面
+    # `if env_type != "local"` 的分发判断读到的是全局 local，会跳过
+    # _execute_remote / _get_or_create_env（owner 容器创建逻辑），直接落到
+    # 本函数末尾的 subprocess.Popen 本机执行——用户代码在宿主机上跑，是
+    # 隔离逃逸。与 terminal_tool.py:1981-1984 同构：owner override 存在时
+    # 必须覆盖 env_type，让守卫和分发看到同一个值。
+    if _overrides.get("env_type"):
+        env_type = _overrides["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
