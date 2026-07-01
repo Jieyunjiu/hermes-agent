@@ -47,6 +47,80 @@ logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 
+# ---------------------------------------------------------------------------
+# T4：多租户下的图片来源收敛（owner 路径收敛 + 禁远程 URL）
+# ---------------------------------------------------------------------------
+#
+# vision_analyze 与 file/execute_code 不同：它跑在 gateway 进程（主机侧），不是
+# 在 owner docker 容器里跑的。所以这里收敛的目标是「宿主机 owner_workspace_root
+# 下的真实路径」，不是容器视角的 /workspace/...；模型传来的 /workspace/... 只是
+# 容器视角的别名，要映射回宿主路径后再在宿主机上校验/读取。
+#
+# 有两条前置入口都会绕过彼此，必须都挂上这个收敛函数：
+#   1. 注册 handler `_handle_vision_analyze`（run_agent 经 registry 调用的路径）；
+#   2. `vision_analyze_tool`（run_agent.py / cli.py / computer_use 等会直接调用，
+#      不经过 registry handler，也不经过 native fast path 判定）。
+# 只挂一处会被另一条路径绕过。
+
+
+def _map_workspace_to_owner_root(image_url: str, root):
+    """把 image_url 映射到宿主机 owner_root 下的真实路径，并校验不越界。
+
+    - `/workspace` 或 `/workspace/...`：容器视角别名，映射为 owner_root 下的
+      对应相对路径（镜像 ``tools/file_tools.py:_resolve_path_for_task`` 的规则）。
+    - 其他绝对路径：按宿主机路径处理，直接校验是否落在 owner_root 内。
+    - 相对路径：固定落到 owner_root 下，不跟随任意 cwd（避免模型靠不同 cwd
+      组合逃逸到其他 owner 目录）。
+
+    越界时返回 None；调用方据此拒绝请求。
+    """
+    from tools.path_security import validate_within_dir
+
+    raw = str(image_url)
+    if raw == "/workspace" or raw.startswith("/workspace/"):
+        rel = raw[len("/workspace"):].lstrip("/")
+        candidate = (root / rel).resolve()
+    else:
+        p = Path(os.path.expanduser(raw))
+        candidate = p.resolve() if p.is_absolute() else (root / p).resolve()
+
+    if validate_within_dir(candidate, root):
+        return None
+    return candidate
+
+
+def resolve_owner_image_source(image_url: str) -> str:
+    """多租户下把 image_url 收敛到 owner workspace 内的本地图片路径。
+
+    - 非多租户模式：原样返回，行为不变。
+    - `http://` / `https://` 远程 URL：直接拒绝（防 SSRF / 任意外联）。
+    - 本地路径（含 `/workspace/...` 容器视角别名）：映射到宿主机
+      owner_workspace_root 下的真实路径并校验不越界；越界拒绝。
+
+    返回值可直接在宿主机上使用（多租户下是映射后的宿主路径；非多租户下是
+    原始 image_url）。抛出 ``ValueError`` 表示拒绝，调用方应转成 tool_error
+    返回给模型（不要泄漏具体宿主路径）。
+    """
+    from gateway.multi_tenant import (
+        get_current_owner_key,
+        multi_tenant_enabled,
+        owner_workspace_root,
+    )
+
+    if not multi_tenant_enabled():
+        return image_url
+    if not isinstance(image_url, str):
+        return image_url
+    if image_url.startswith(("http://", "https://")):
+        raise ValueError("refused: remote image URLs are disabled in multi-tenant mode.")
+
+    root = owner_workspace_root(get_current_owner_key())
+    resolved = _map_workspace_to_owner_root(image_url, root)
+    if resolved is None:
+        raise ValueError("refused: image path is outside your workspace.")
+    return str(resolved)
+
+
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
 # Resolution: config.yaml auxiliary.vision.download_timeout → env var → 30s default.
@@ -861,6 +935,13 @@ async def vision_analyze_tool(
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
+        # T4：run_agent 会直接调用 vision_analyze_tool，绕过 _handle_vision_analyze
+        # 和 native fast path 判定，所以这条直调路径必须单独兜底收敛/禁 URL。
+        try:
+            image_url = resolve_owner_image_source(image_url)
+        except ValueError as e:
+            return tool_error(str(e), status="error")
+
         logger.info("Analyzing image: %s", image_url[:60])
         logger.info("User prompt: %s", user_prompt[:100])
         
@@ -1194,9 +1275,24 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
+async def _vision_analyze_rejected(message: str) -> str:
+    """把拒绝原因包装成可 await 的结果，保持 `_handle_vision_analyze` 的
+    `Awaitable[str]` 契约（它本身是同步函数，靠返回协程对象来满足这个类型）。
+    """
+    return tool_error(message, status="error")
+
+
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
+
+    # T4：多租户下把 image_url 收敛到 owner workspace 内的真实路径，并拒绝远程
+    # URL。必须放在 native fast path 判定之前——否则原生视觉快路会绕过收敛，
+    # 直接下载/读取任意路径。
+    try:
+        image_url = resolve_owner_image_source(image_url)
+    except ValueError as e:
+        return _vision_analyze_rejected(str(e))
 
     # Fast path: when native image routing is in effect for the active main
     # model (provider accepts images in tool results, or the user set the
