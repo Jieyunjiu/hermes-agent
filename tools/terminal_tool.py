@@ -1244,6 +1244,38 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     )
 
 
+def apply_owner_override(env_type: str, config: dict, overrides: dict) -> "tuple[str, dict, str | None]":
+    """把 owner override 合并到 (env_type, container_config, host_cwd) 上。
+
+    override 缺省时退回 config（单用户/非多租户不受影响）。凡创建容器处都要用它，
+    避免只改 env_type 却用了全局的 host_cwd/网络/挂载（terminal / file / execute_code
+    三处复用同一份逻辑，防止只切 T2/T3 其中一处导致挂载/网络配置在两条工具链上不一致）。
+
+    ⚠️ host_cwd 是 `_create_environment` 的**独立参数**（见下方 `_create_environment`
+    签名），不在 container_config 内——所以单独返回，调用方以 `host_cwd=` 传入。
+
+    返回 (effective_env_type, container_config, host_cwd)。
+    """
+    if overrides.get("env_type"):
+        env_type = overrides["env_type"]
+    host_cwd = overrides.get("host_cwd", config.get("host_cwd"))
+    cc = {
+        "container_cpu": overrides.get("container_cpu", config.get("container_cpu", 1)),
+        "container_memory": overrides.get("container_memory", config.get("container_memory", 5120)),
+        "container_disk": config.get("container_disk", 51200),
+        "container_persistent": overrides.get("container_persistent", config.get("container_persistent", True)),
+        "docker_volumes": overrides.get("docker_volumes", config.get("docker_volumes", [])),
+        "docker_mount_cwd_to_workspace": overrides.get("docker_mount_cwd_to_workspace", config.get("docker_mount_cwd_to_workspace", False)),
+        "network": overrides.get("network", config.get("network", True)),
+        "mount_credentials": overrides.get("mount_credentials", config.get("mount_credentials", True)),
+        "mount_skills": overrides.get("mount_skills", config.get("mount_skills", True)),
+        "mount_cache": overrides.get("mount_cache", config.get("mount_cache", True)),
+        "docker_forward_env": config.get("docker_forward_env", []),
+        "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+    }
+    return env_type, cc, host_cwd
+
+
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,

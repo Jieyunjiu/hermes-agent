@@ -780,6 +780,29 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
+def _multi_tenant_sandbox_guard(task_id: str) -> "str | None":
+    """多租户 sandbox 下，若解析不到 owner docker override，返回结构化错误串（否则 None）。
+
+    与 terminal 的 fail-closed 守卫同源（terminal_tool.py 里 `terminal_tool` 函数的
+    对应检查）：override 缺 env_type=docker 一律拒绝，绝不退回主机 local 或全局
+    docker（那不是 owner 绑定的容器，属于隔离泄漏）。
+    """
+    from gateway.multi_tenant import multi_tenant_enabled, sandbox_enabled
+    if not (multi_tenant_enabled() and sandbox_enabled()):
+        return None
+    from tools.terminal_tool import resolve_task_overrides
+    overrides = resolve_task_overrides(task_id or "default")
+    if overrides.get("env_type") != "docker":
+        import json
+        return json.dumps({
+            "error": "refused: multi-tenant sandbox requires an owner docker override, "
+                     "but none was resolved for this session. File op blocked to avoid "
+                     "running on the host or in a non-owner container.",
+            "status": "error",
+        }, ensure_ascii=False)
+    return None
+
+
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     """Get or create ShellFileOperations for a terminal environment.
 
@@ -795,20 +818,17 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     parent's container and its cached file_ops. RL/benchmark task_ids with
     a registered env override keep their isolation.
     """
-    # 多租户 A 方案：进程内直接读写 owner_root，不建 docker 容器（R3#5 / §9.8c(a)）。
-    # 必须在 from tools.terminal_tool import _create_environment 之前 return，
-    # 确保 docker/singularity/modal 等后端完全不被触碰。
-    _mt_root = _multi_tenant_workspace_root()
-    if _mt_root is not None:
-        from tools.environments.local import LocalEnvironment
-        return ShellFileOperations(LocalEnvironment(cwd=str(_mt_root)))
-
+    # 注：多租户 A 方案（进程内直接读写 owner_root，不建 docker 容器）已撤销。
+    # 现在多租户 sandbox 下 file 工具与 terminal 落到同一个 owner docker 容器，
+    # 由 handler 层的 `_multi_tenant_sandbox_guard` 做 fail-closed 前置校验
+    # （见 `_handle_read_file` 等四个 handler），本函数不再需要单独分支。
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
         _resolve_container_task_id,
+        apply_owner_override,
     )
     import time
 
@@ -849,8 +869,12 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             from tools.terminal_tool import resolve_task_overrides
 
             config = _get_env_config()
-            env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
+            # owner override（多租户 sandbox 下由 owner 容器绑定）驱动 env_type +
+            # 容器参数；非多租户/无 override 时原样退回全局 config，行为不变。
+            env_type, container_config, host_cwd = apply_owner_override(
+                config["env_type"], config, overrides
+            )
 
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
@@ -865,19 +889,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
             cwd = overrides.get("cwd") or config["cwd"]
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
-
-            container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
-                container_config = {
-                    "container_cpu": config.get("container_cpu", 1),
-                    "container_memory": config.get("container_memory", 5120),
-                    "container_disk": config.get("container_disk", 51200),
-                    "container_persistent": config.get("container_persistent", True),
-                    "docker_volumes": config.get("docker_volumes", []),
-                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                    "docker_forward_env": config.get("docker_forward_env", []),
-                    "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                }
 
             ssh_config = None
             if env_type == "ssh":
@@ -904,7 +915,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 container_config=container_config,
                 local_config=local_config,
                 task_id=task_id,
-                host_cwd=config.get("host_cwd"),
+                host_cwd=host_cwd,
             )
 
             with _env_lock:
@@ -1806,11 +1817,17 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
+    _mt_refused = _multi_tenant_sandbox_guard(tid)
+    if _mt_refused is not None:
+        return _mt_refused
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
+    _mt_refused = _multi_tenant_sandbox_guard(tid)
+    if _mt_refused is not None:
+        return _mt_refused
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
             "write_file: missing required field 'path'. Re-emit the tool call with "
@@ -1837,6 +1854,9 @@ def _handle_write_file(args, **kw):
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    _mt_refused = _multi_tenant_sandbox_guard(tid)
+    if _mt_refused is not None:
+        return _mt_refused
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
@@ -1847,6 +1867,9 @@ def _handle_patch(args, **kw):
 
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
+    _mt_refused = _multi_tenant_sandbox_guard(tid)
+    if _mt_refused is not None:
+        return _mt_refused
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
