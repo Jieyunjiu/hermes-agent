@@ -1272,6 +1272,26 @@ def apply_owner_override(env_type: str, config: dict, overrides: dict) -> "tuple
         "mount_cache": overrides.get("mount_cache", config.get("mount_cache", True)),
         "docker_forward_env": config.get("docker_forward_env", []),
         "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        # 以下四个键此前遗漏，导致 file / execute_code 走本 helper 时
+        # container_config 与 terminal 工具的内联 dict（execute_command 内）
+        # 不一致：
+        # - docker_persist_across_processes 缺失 → `_create_environment` 用
+        #   自身默认值 True，把 gateway 钉死的 False（每进程隔离）悄悄变回
+        #   True，导致 gateway 进程退出后容器不被回收（跨进程滞留）。
+        # - docker_env/docker_extra_args/docker_orphan_reaper/modal_mode 同样
+        #   会在 file/execute_code 建容器时被 `_create_environment` 的默认值
+        #   取代，而不是走全局 config（与 terminal 工具行为不一致）。
+        # 取值方式与 terminal 内联 dict 保持一致：docker_persist_across_processes
+        # 允许 override 覆盖（owner override 会钉死为 False），其余四个只取
+        # 全局 config（terminal 内联对它们也没有 override 支持）。
+        "docker_persist_across_processes": overrides.get(
+            "docker_persist_across_processes",
+            config.get("docker_persist_across_processes", True),
+        ),
+        "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+        "docker_env": config.get("docker_env", {}),
+        "docker_extra_args": config.get("docker_extra_args", []),
+        "modal_mode": config.get("modal_mode", "auto"),
     }
     return env_type, cc, host_cwd
 

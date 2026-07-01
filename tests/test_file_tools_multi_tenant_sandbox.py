@@ -158,3 +158,52 @@ def test_patch_tool_replace_passes_container_path_to_file_ops(monkeypatch):
     assert not result.get("error"), result
     # 关键断言：交给执行器的必须是容器内 /workspace 路径，不是宿主机绝对路径。
     assert captured["path"] == "/workspace/sub/y.txt"
+
+
+def test_apply_owner_override_carries_docker_persist_across_processes():
+    """apply_owner_override（file / execute_code 共用的合并 helper）产出的
+    container_config 必须带上 docker_persist_across_processes 这个键。
+
+    背景：gateway/multi_tenant.py 里 build_owner_sandbox_overrides 把它钉死为
+    False（每进程隔离，进程退出即 stop+rm 容器，防跨进程滞留）。terminal 工具
+    走的是内联 dict，天然带这个键；但 file / execute_code 走 apply_owner_override，
+    这个 helper 之前漏了这个键 —— 结果 `_create_environment` 用它自己的默认值
+    `cc.get("docker_persist_across_processes", True)`，把 False 悄悄变回 True。
+    如果某 session 第一个工具调用恰好是 write_file/execute_code 而不是 terminal，
+    容器就会以 persist_across_processes=True 建立，gateway 进程退出时不被回收，
+    造成跨进程容器泄漏（非确定性，取决于谁先跑）。
+    """
+    from tools.terminal_tool import apply_owner_override
+
+    overrides = {"env_type": "docker", "docker_persist_across_processes": False}
+    _env_type, cc, _host_cwd = apply_owner_override("local", {}, overrides)
+
+    assert cc.get("docker_persist_across_processes") is False
+
+
+def test_apply_owner_override_matches_terminal_inline_container_config_keys():
+    """apply_owner_override 和 terminal 工具内联 container_config dict
+    （tools/terminal_tool.py 里 execute_command 内那一份）必须产出同一组键，
+    否则同一个 session 里 terminal 和 file/execute_code 建出来的容器配置会不一致。
+
+    这里不比较取值细节（override/config 来源不同是设计如此），只比较键的集合，
+    确认 file/execute_code 这条路径不会漏传 terminal 那条路径有的开关。
+    """
+    from tools.terminal_tool import apply_owner_override
+
+    # 覆盖 terminal 内联 dict 里除隔离键（network/mount_*/docker_volumes 等，
+    # 这些审查已确认合并正确，不在本次修复范围内）之外，容易被漏掉的非隔离键。
+    overrides = {
+        "env_type": "docker",
+        "docker_persist_across_processes": False,
+    }
+    config = {
+        "modal_mode": "auto",
+        "docker_env": {"FOO": "bar"},
+        "docker_extra_args": ["--pull=never"],
+        "docker_orphan_reaper": True,
+    }
+    _env_type, cc, _host_cwd = apply_owner_override("docker", config, overrides)
+
+    for key in ("modal_mode", "docker_env", "docker_extra_args", "docker_orphan_reaper", "docker_persist_across_processes"):
+        assert key in cc, f"apply_owner_override 缺少键: {key}"
