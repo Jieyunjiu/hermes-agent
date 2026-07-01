@@ -425,6 +425,16 @@ def get_external_skills_dirs() -> List[Path]:
     parsing a non-trivial config dominates ``hermes`` cold-start time
     when the cache is absent.
     """
+    try:
+        from gateway.multi_tenant import multi_tenant_enabled
+
+        if multi_tenant_enabled():
+            # 多租户：企业场景要求用户只能用公司统一开发的 skills，
+            # 不采纳 skills.external_dirs 等用户可写来源，只留内置只读 SKILLS_DIR。
+            return []
+    except ImportError:
+        pass
+
     config_path = get_config_path()
     if not config_path.exists():
         return []

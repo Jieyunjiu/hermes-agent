@@ -917,6 +917,20 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
+            from gateway.multi_tenant import multi_tenant_enabled
+
+            if multi_tenant_enabled():
+                # 多租户：企业场景不允许加载 plugin 提供的 skill（不受 operator
+                # 只读目录管控），在 discover_plugins()/find_plugin_skill() 之前
+                # 直接拒绝，确保根本不 discover/serve。
+                return json.dumps(
+                    {
+                        "error": f"plugin skills are not available in multi-tenant mode: {name}",
+                        "status": "error",
+                    },
+                    ensure_ascii=False,
+                )
+
             discover_plugins()  # idempotent
             pm = get_plugin_manager()
             plugin_skill_md = pm.find_plugin_skill(name)
