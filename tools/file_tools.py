@@ -1423,7 +1423,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            # 多租户下 file_ops 经 docker exec 在 owner 容器里执行，容器看不到
+            # 宿主机路径，必须把 _resolved（宿主机绝对路径）换算成容器内
+            # /workspace 路径再传给执行器；_resolved 本身仍用于锁/校验/告警。
+            # 注意：传 _resolved（而非原始 path）作为 original 参数——非多租户
+            # legacy 模式下 _file_ops_path_for_call 原样返回 original，必须仍是
+            # 绝对解析路径，否则会退回未解析的相对路径，重新引入 worktree-cwd bug。
+            _file_ops_call_path = _file_ops_path_for_call(_resolved, Path(_resolved))
+            result = file_ops.write_file(_file_ops_call_path, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
@@ -1563,7 +1570,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                # 多租户下同 write_file：容器内看不到宿主机路径，把 _replace_target
+                # （宿主机绝对路径）换算成 /workspace 下的容器路径再交给执行器。
+                # 传 _replace_target 本身（而非原始 path）作为 original——非多租户
+                # legacy 模式下会原样返回 original，必须仍是绝对解析路径。
+                _replace_call_path = _file_ops_path_for_call(_replace_target, Path(_replace_target))
+                result = file_ops.patch_replace(_replace_call_path, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")

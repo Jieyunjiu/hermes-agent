@@ -6,11 +6,17 @@
   （host_cwd/network/mount_* 等），而不是全局 TERMINAL_ENV 配置。
 - `_file_ops_path_for_call` 在多租户下必须把宿主机绝对路径转成容器内 /workspace
   路径（file 工具现在经 docker exec 在 owner 容器里执行，容器看不到宿主机路径）。
+- `write_file_tool` / `patch_tool`（replace 模式）真正调用 `file_ops.write_file`
+  / `file_ops.patch_replace` 时，传的必须是换算后的容器路径，而不是宿主机绝对
+  路径——之前只测了 `_file_ops_path_for_call` 这个 helper 本身，没覆盖真实调用
+  点，漏掉了这两处未接线的 bug（T2 第二次收尾修复）。
 
 对应 `.superpowers/sdd/task-2-brief.md`。
 """
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import tools.file_tools as ft
 
@@ -100,3 +106,55 @@ def test_file_ops_path_for_call_returns_original_when_not_multi_tenant(monkeypat
     monkeypatch.setattr(ft, "_multi_tenant_workspace_root", lambda: None)
     resolved = Path("/home/user/project/x.txt")
     assert ft._file_ops_path_for_call("x.txt", resolved) == "x.txt"
+
+
+def test_write_file_tool_passes_container_path_to_file_ops(monkeypatch):
+    # 回归：write_file_tool 之前把宿主机绝对路径（_resolved）直接传给
+    # file_ops.write_file，绕过了 _file_ops_path_for_call 的换算。多租户 docker
+    # 下容器看不到宿主机路径，这会在容器可写层 mkdir -p 出孤儿文件——宿主机看
+    # 不到、容器销毁即丢、之后用 /workspace/x 也读不到，属于静默数据丢失。
+    owner_root = Path("/data/workspaces/hashA")
+    monkeypatch.setattr(ft, "_multi_tenant_workspace_root", lambda: owner_root)
+
+    captured = {}
+
+    def _write_file(path, content):
+        captured["path"] = path
+        return SimpleNamespace(to_dict=lambda: {"bytes_written": len(content)})
+
+    fake_ops = MagicMock()
+    fake_ops.write_file = _write_file
+    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": fake_ops)
+
+    out = ft.write_file_tool(path="/workspace/sub/x.txt", content="hi", task_id="sess-write-1")
+    result = json.loads(out)
+    assert not result.get("error"), result
+    # 关键断言：交给执行器的必须是容器内 /workspace 路径，不是宿主机绝对路径。
+    assert captured["path"] == "/workspace/sub/x.txt"
+
+
+def test_patch_tool_replace_passes_container_path_to_file_ops(monkeypatch):
+    # 回归：patch_tool 的 replace 分支之前把 _path_to_resolved（宿主机绝对路径）
+    # 直接传给 file_ops.patch_replace。多租户 docker 下容器内 cat 不到该路径，
+    # replace 会直接失败（"Could not find" 之类），而不是在正确文件上生效。
+    owner_root = Path("/data/workspaces/hashA")
+    monkeypatch.setattr(ft, "_multi_tenant_workspace_root", lambda: owner_root)
+
+    captured = {}
+
+    def _patch_replace(path, old_string, new_string, replace_all=False):
+        captured["path"] = path
+        return SimpleNamespace(to_dict=lambda: {"success": True, "diff": "--- a\n+++ b\n"})
+
+    fake_ops = MagicMock()
+    fake_ops.patch_replace = _patch_replace
+    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": fake_ops)
+
+    out = ft.patch_tool(
+        mode="replace", path="/workspace/sub/y.txt",
+        old_string="a", new_string="b", task_id="sess-patch-1",
+    )
+    result = json.loads(out)
+    assert not result.get("error"), result
+    # 关键断言：交给执行器的必须是容器内 /workspace 路径，不是宿主机绝对路径。
+    assert captured["path"] == "/workspace/sub/y.txt"
