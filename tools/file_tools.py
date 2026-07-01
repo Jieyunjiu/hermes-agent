@@ -316,10 +316,24 @@ def _validate_multi_tenant_workspace_path(path: Path) -> str | None:
 
 
 def _file_ops_path_for_call(original: str, resolved: Path) -> str:
-    """Use absolute owner-workspace paths only when multi-tenancy is active."""
-    if _multi_tenant_workspace_root() is not None:
-        return str(resolved)
-    return original
+    """多租户下，返回容器内路径而不是宿主机路径。
+
+    T2 把多租户下的 file 工具执行从"进程内直接读写"改成了"经 docker exec
+    在 owner 容器里跑"（见 `_get_file_ops`）。容器看不到宿主机文件系统，只有
+    owner_root 被 bind mount 到容器内的 /workspace。所以这里必须把 `resolved`
+    （宿主机绝对路径）换算成 /workspace 下的相对路径，再交给 docker exec 里
+    的 shell 命令，否则容器内找不到文件、读写会直接失败。
+
+    调用方必须先经过 `_validate_multi_tenant_workspace_path` 做越界校验，
+    这里只负责换算路径本身，不重复做安全校验。
+    """
+    owner_root = _multi_tenant_workspace_root()
+    if owner_root is None:
+        return original
+    if resolved == owner_root:
+        return "/workspace"
+    rel = resolved.relative_to(owner_root)
+    return f"/workspace/{rel.as_posix()}"
 
 
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:

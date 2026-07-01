@@ -4,10 +4,13 @@
 - 无 owner docker override 时，四个 file handler 必须拒绝（不落回主机/无 owner 容器）。
 - 有 owner docker override 时，`_get_file_ops` 建容器的参数必须来自 override
   （host_cwd/network/mount_* 等），而不是全局 TERMINAL_ENV 配置。
+- `_file_ops_path_for_call` 在多租户下必须把宿主机绝对路径转成容器内 /workspace
+  路径（file 工具现在经 docker exec 在 owner 容器里执行，容器看不到宿主机路径）。
 
 对应 `.superpowers/sdd/task-2-brief.md`。
 """
 import json
+from pathlib import Path
 
 import tools.file_tools as ft
 
@@ -73,3 +76,27 @@ def test_owner_override_drives_full_container_config(monkeypatch):
     assert captured["cc"].get("mount_credentials") is False
     assert captured["cc"].get("mount_cache") is False
     assert captured["host_cwd"] == "/data/ws/hashA"   # 独立参数，workspace 真正挂载靠它
+
+
+def test_file_ops_path_for_call_maps_to_container_workspace(monkeypatch):
+    # file 工具现在经 docker exec 在 owner 容器里执行（见 `_get_file_ops`），
+    # 容器里看不到宿主机文件系统，只能看到 bind mount 到 /workspace 的 owner_root。
+    # 所以传给容器执行器的路径必须是 /workspace/<相对路径>，而不是宿主机绝对路径。
+    owner_root = Path("/data/workspaces/hashA")
+    monkeypatch.setattr(ft, "_multi_tenant_workspace_root", lambda: owner_root)
+
+    resolved_file = owner_root / "x.txt"
+    assert ft._file_ops_path_for_call("/workspace/x.txt", resolved_file) == "/workspace/x.txt"
+
+    resolved_nested = owner_root / "sub" / "y.txt"
+    assert ft._file_ops_path_for_call("/workspace/sub/y.txt", resolved_nested) == "/workspace/sub/y.txt"
+
+    # resolved 恰好等于 owner_root 本身（例如列目录时传根目录）-> 容器内就是 /workspace
+    assert ft._file_ops_path_for_call("/workspace", owner_root) == "/workspace"
+
+
+def test_file_ops_path_for_call_returns_original_when_not_multi_tenant(monkeypatch):
+    # 非多租户模式（legacy 单用户）行为不变：直接用调用方原始传入的路径。
+    monkeypatch.setattr(ft, "_multi_tenant_workspace_root", lambda: None)
+    resolved = Path("/home/user/project/x.txt")
+    assert ft._file_ops_path_for_call("x.txt", resolved) == "x.txt"
