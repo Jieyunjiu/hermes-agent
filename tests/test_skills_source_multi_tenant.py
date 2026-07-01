@@ -40,3 +40,6 @@ def test_plugin_skill_load_rejected_under_multi_tenant(monkeypatch):
     out = st._skill_view_with_bump({"name": "superpowers:writing-plans"})
     data = json.loads(out)
     assert data.get("status") == "error" or "not available" in json.dumps(data).lower()
+    # 下游 acp_adapter/tools.py:_format_skill_view_result() 用 data.get("success") is False
+    # 来判断拒绝，补上该契约以防回归
+    assert data.get("success") is False

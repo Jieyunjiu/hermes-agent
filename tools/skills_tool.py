@@ -925,6 +925,7 @@ def skill_view(
                 # 直接拒绝，确保根本不 discover/serve。
                 return json.dumps(
                     {
+                        "success": False,
                         "error": f"plugin skills are not available in multi-tenant mode: {name}",
                         "status": "error",
                     },
