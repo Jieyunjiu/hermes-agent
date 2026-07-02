@@ -194,10 +194,27 @@ def get_current_owner_key() -> str:
     When multi-tenancy is *off*, a missing key simply returns "" so legacy
     single-user code paths keep working.
     """
-    value = _OWNER_KEY.get()
-    if value is _UNSET:
-        value = ""
+    raw = _OWNER_KEY.get()
+    value = "" if raw is _UNSET else raw
     if multi_tenant_enabled() and not value:
+        # === 临时诊断（T11）：owner_key 在 agent 执行阶段丢失，dev 无法复现，===
+        # === 在真实企业微信下崩溃时抓取上下文，定位后删除此块。===============
+        try:
+            import threading, asyncio, traceback
+            _thr = threading.current_thread()
+            try:
+                _task = asyncio.current_task()
+                _task_name = _task.get_name() if _task else None
+            except Exception:
+                _task_name = None
+            _origin = "_UNSET(从未在本上下文 set)" if raw is _UNSET else f'""(被显式清空 clear)'
+            _stack = "".join(traceback.format_stack(limit=8)[:-1])
+            logger.warning(
+                "[T11-DIAG] OwnerKeyMissing: raw=%s thread=%s(%s) task=%s\n调用栈:\n%s",
+                _origin, _thr.name, _thr.ident, _task_name, _stack,
+            )
+        except Exception:
+            logger.debug("[T11-DIAG] 诊断日志本身出错", exc_info=True)
         # fail-closed: refuse rather than fall back to a shared namespace.
         raise OwnerKeyMissing(
             "multi-tenant mode is enabled but no owner key is bound to this "
