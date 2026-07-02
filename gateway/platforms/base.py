@@ -1250,6 +1250,57 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     return None
 
 
+def _map_workspace_delivery_path_to_owner_root(path: str) -> Optional[str]:
+    """\u591a\u79df\u6237\u6a21\u5f0f\u4e0b\uff0c\u628a\u6a21\u578b\u7ed9\u51fa\u7684\u5bb9\u5668\u89c6\u89d2 ``/workspace/...`` \u8def\u5f84\u6362\u7b97\u6210\u5bbf\u4e3b\u673a
+    owner_root \u4e0b\u7684\u771f\u5b9e\u8def\u5f84\uff0c\u518d\u4ea4\u7ed9 :func:`validate_media_delivery_path` \u6821\u9a8c\u3002
+
+    \u80cc\u666f\uff08T8\uff09\uff1a\u591a\u79df\u6237 sandbox \u628a\u5bbf\u4e3b\u673a owner_root \u76ee\u5f55 bind mount \u5230\u5bb9\u5668\u5185\u7684
+    ``/workspace``\uff08\u4e0d\u5e26 hash\uff09\u3002agent \u5728\u5bb9\u5668\u91cc\u4ea7\u51fa\u6587\u4ef6\u540e\uff0cMEDIA:/bare-path
+    \u91cc\u5199\u7684\u53ea\u4f1a\u662f\u5bb9\u5668\u89c6\u89d2\u8def\u5f84\uff0c\u4f8b\u5982 ``/workspace/report.docx``\u3002\u4f46\u6821\u9a8c\u903b\u8f91\u8fd0\u884c
+    \u5728\u5bbf\u4e3b\u673a\u7f51\u5173\u8fdb\u7a0b\u91cc\uff0c``/workspace/report.docx`` \u5728\u5bbf\u4e3b\u673a\u4e0a\u5e76\u4e0d\u5b58\u5728\u2014\u2014\u4e0d\u505a
+    \u6362\u7b97\u5c31\u4f1a\u4e00\u76f4\u88ab\u5224\u5b9a\u4e3a"\u6587\u4ef6\u4e0d\u5b58\u5728"\u800c\u9759\u9ed8\u4e22\u5f03\u6574\u6761\u56de\u590d\u7684\u9644\u4ef6\u3002
+
+    \u975e ``/workspace`` \u524d\u7f00\u7684\u8def\u5f84\u3001\u4ee5\u53ca\u975e\u591a\u79df\u6237\u6a21\u5f0f\uff0c\u539f\u6837\u8fd4\u56de\uff0c\u884c\u4e3a\u4e0e\u6539\u52a8\u524d
+    \u5b8c\u5168\u4e00\u81f4\uff08\u5bf9\u5e94\u5355\u7528\u6237\u6a21\u5f0f\u3001\u4ee5\u53ca\u591a\u79df\u6237\u4e0b\u6a21\u578b\u76f4\u63a5\u7ed9\u51fa\u5bbf\u4e3b\u673a\u8def\u5f84\u7684\u573a\u666f\uff09\u3002
+
+    fail-closed\uff08\u4e0d\u53ef\u7834\u7ea6\u675f\u2014\u2014\u89c1 study/multi-tenant-wecom-rebuild-plan.md\uff09\uff1a
+    - \u53d6\u4e0d\u5230 owner_key\uff08ContextVar \u672a\u7ed1\u5b9a/\u5df2\u6e05\u7a7a\uff09\u65f6\u8fd4\u56de ``None``\uff0c\u7edd\u4e0d\u628a
+      ``/workspace/...`` \u5f53\u5bbf\u4e3b\u673a\u8def\u5f84\u76f4\u63a5\u653e\u884c\uff0c\u907f\u514d\u8bef\u53d1\u5230\u9519\u8bef\u7684\u76ee\u5f55\u3002
+    - \u6362\u7b97\u7ed3\u679c\u5fc5\u987b\u843d\u5728 owner_root \u5185\uff1b\u8d8a\u754c\uff08``..``\u3001symlink \u9003\u9038\u7b49\uff09\u4e00\u5f8b\u8fd4\u56de
+      ``None``\uff0c\u7edd\u4e0d\u56de\u9000\u5230\u5bbf\u4e3b\u673a\u4efb\u610f\u8def\u5f84\u3002
+    """
+    from gateway.multi_tenant import (
+        OwnerKeyMissing,
+        get_current_owner_key,
+        multi_tenant_enabled,
+        owner_workspace_root,
+    )
+
+    if not multi_tenant_enabled():
+        return path
+
+    if path != "/workspace" and not path.startswith("/workspace/"):
+        return path
+
+    try:
+        owner_key = get_current_owner_key()
+    except OwnerKeyMissing:
+        return None
+
+    root = owner_workspace_root(owner_key)
+    rel = path[len("/workspace"):].lstrip("/")
+    mapped = (root / rel) if rel else root
+
+    try:
+        resolved_mapped = mapped.resolve()
+        resolved_root = root.resolve()
+        resolved_mapped.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return None
+
+    return str(mapped)
+
+
 # Neutralise control chars and the Unicode line separators (NEL, LS, PS) that
 # str.splitlines() / log aggregators treat as breaks, so a model-emitted path
 # can't forge a second log line. Truncated to keep records bounded.
@@ -3168,7 +3219,10 @@ class BasePlatformAdapter(ABC):
         safe_media: List[Tuple[str, bool]] = []
         for media_path, is_voice in media_files or []:
             raw = str(media_path)
-            safe_path = validate_media_delivery_path(raw)
+            # T8：多租户下先把容器视角 /workspace/... 换算成宿主机 owner_root
+            # 路径，再交给 validate_media_delivery_path 校验文件是否存在。
+            mapped_path = _map_workspace_delivery_path_to_owner_root(raw)
+            safe_path = validate_media_delivery_path(mapped_path) if mapped_path is not None else None
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
@@ -3181,7 +3235,9 @@ class BasePlatformAdapter(ABC):
         safe_paths: List[str] = []
         for file_path in file_paths or []:
             raw = str(file_path)
-            safe_path = validate_media_delivery_path(raw)
+            # T8：同上，先做 /workspace -> owner_root 的换算。
+            mapped_path = _map_workspace_delivery_path_to_owner_root(raw)
+            safe_path = validate_media_delivery_path(mapped_path) if mapped_path is not None else None
             if safe_path:
                 safe_paths.append(safe_path)
             else:

@@ -1639,3 +1639,135 @@ class TestMediaDeliveryDiagnosability:
         assert any(r.endswith("cache/documents") for r in roots)
         # Legacy layout still present.
         assert any(r.endswith("image_cache") for r in roots)
+
+
+class TestMultiTenantWorkspaceDeliveryPathMapping:
+    """T8: 出站附件投递把容器视角 ``/workspace/...`` 映射回宿主机 owner_root。
+
+    背景：多租户 sandbox 把宿主机 owner_root bind mount 到容器内的
+    ``/workspace``。agent 在容器里产出文件后，MEDIA:/bare-path 里写的是
+    ``/workspace/xxx.docx``，但 ``validate_media_delivery_path`` 运行在宿主机
+    进程里，``/workspace/xxx.docx`` 在宿主机上根本不存在 —— 校验必然失败，
+    响应被静默丢弃。这里验证 ``filter_media_delivery_paths`` /
+    ``filter_local_delivery_paths`` 在多租户模式下会先把 ``/workspace/...``
+    换算成宿主机 owner_root 路径，并且换算结果必须落在 owner_root 内、
+    取不到 owner_key 时必须拒绝投递（fail-closed，不回退到宿主机任意路径）。
+    """
+
+    def _enable_multi_tenant(self, monkeypatch, workspace_root):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "security": {
+                    "multi_tenant": {
+                        "enabled": True,
+                        "workspace_root": str(workspace_root),
+                    }
+                }
+            },
+        )
+
+    def test_media_workspace_path_maps_to_owner_root(self, tmp_path, monkeypatch):
+        """``/workspace/report.docx`` -> 宿主机 owner_root/report.docx，且被接受投递。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+        from gateway.multi_tenant import (
+            clear_current_owner_key,
+            owner_workspace_root,
+            set_current_owner_key,
+        )
+
+        owner_key = "wecom:corp:app:alice"
+        owner_root = owner_workspace_root(owner_key)
+        owner_root.mkdir(parents=True, exist_ok=True)
+        report = owner_root / "report.docx"
+        report.write_bytes(b"PK\x03\x04")
+
+        try:
+            set_current_owner_key(owner_key)
+            out = BasePlatformAdapter.filter_media_delivery_paths(
+                [("/workspace/report.docx", False)]
+            )
+        finally:
+            clear_current_owner_key()
+
+        assert out == [(str(report.resolve()), False)]
+
+    def test_local_workspace_path_maps_to_owner_root(self, tmp_path, monkeypatch):
+        """filter_local_delivery_paths 走同样的换算逻辑。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+        from gateway.multi_tenant import (
+            clear_current_owner_key,
+            owner_workspace_root,
+            set_current_owner_key,
+        )
+
+        owner_key = "wecom:corp:app:bob"
+        owner_root = owner_workspace_root(owner_key)
+        owner_root.mkdir(parents=True, exist_ok=True)
+        note = owner_root / "note.md"
+        note.write_text("hello")
+
+        try:
+            set_current_owner_key(owner_key)
+            out = BasePlatformAdapter.filter_local_delivery_paths(["/workspace/note.md"])
+        finally:
+            clear_current_owner_key()
+
+        assert out == [str(note.resolve())]
+
+    def test_workspace_path_escaping_owner_root_is_rejected(self, tmp_path, monkeypatch):
+        """``/workspace/../..`` 之类的越界路径必须被拒绝，绝不投递到 owner_root 之外。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+        from gateway.multi_tenant import (
+            clear_current_owner_key,
+            owner_workspace_root,
+            set_current_owner_key,
+        )
+
+        owner_key = "wecom:corp:app:eve"
+        owner_root = owner_workspace_root(owner_key)
+        owner_root.mkdir(parents=True, exist_ok=True)
+        # 在 workspaces 根目录（owner_root 的父目录）放一个"别人的"文件，
+        # 模拟越界访问的目标。
+        outside = owner_root.parent / "secret.docx"
+        outside.write_bytes(b"PK\x03\x04")
+
+        try:
+            set_current_owner_key(owner_key)
+            out = BasePlatformAdapter.filter_media_delivery_paths(
+                [("/workspace/../secret.docx", False)]
+            )
+        finally:
+            clear_current_owner_key()
+
+        assert out == []
+
+    def test_missing_owner_key_rejects_workspace_path(self, tmp_path, monkeypatch):
+        """多租户开启但取不到 owner_key 时，/workspace 路径必须被拒绝而不是回退。"""
+        self._enable_multi_tenant(monkeypatch, tmp_path / "workspaces")
+        from gateway.multi_tenant import clear_current_owner_key
+
+        # 显式清空（而非绑定），模拟 owner_key 在投递点已丢失/未绑定的场景。
+        clear_current_owner_key()
+        out = BasePlatformAdapter.filter_media_delivery_paths(
+            [("/workspace/report.docx", False)]
+        )
+        assert out == []
+
+    def test_single_user_mode_untouched(self, tmp_path, monkeypatch):
+        """非多租户模式下，行为完全不变：不做任何 /workspace 映射。"""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {},
+        )
+        # /workspace/report.docx 在宿主机上不存在 -> 和改动前一样被拒绝。
+        out = BasePlatformAdapter.filter_media_delivery_paths(
+            [("/workspace/report.docx", False)]
+        )
+        assert out == []
+
+        # 单用户模式下的正常绝对路径投递不受影响。
+        doc = tmp_path / "report.docx"
+        doc.write_bytes(b"PK\x03\x04")
+        out2 = BasePlatformAdapter.filter_media_delivery_paths([(str(doc), False)])
+        assert out2 == [(str(doc.resolve()), False)]
