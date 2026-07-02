@@ -1902,4 +1902,7 @@ def build_capability_manifest() -> str:
         "- The sandbox has no network access. Do not try to install packages or fetch "
         "from the internet; the libraries you need are already installed.\n"
         "- User-uploaded files are under /workspace/uploads/.\n"
+        "- Pre-installed libraries (use these; do NOT pip install — no network): Python — "
+        "pandas, numpy, openpyxl, python-docx, python-pptx, reportlab, matplotlib, "
+        "pdfplumber, PyPDF2, Pillow; plus LibreOffice (headless), Python 3.11, Node.js 20.\n"
     )
