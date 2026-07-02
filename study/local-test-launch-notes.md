@@ -35,6 +35,42 @@ HERMES_HOME=~/.hermes-dev hermes gateway   # 用 dev 目录隔离，不碰 ~/.he
 
 **实测重点**：上传→execute_code 跑 pdfplumber→write_file 出 word，三者同容器同 `/workspace` 接力；A/B 双 owner 互相看不到文件；容器内 `pip install` 外网失败（禁网生效）。
 
+## 多租户斜杠命令权限（管理员全命令 / 普通用户受限）
+
+企业多租户下，用现成的 `gateway/slash_access.py`（三档：admin / user / unrestricted，**在命令分发处 `run.py:_check_slash_access` 真强制**）限制普通用户只能用少数命令，管理员全开。**纯配置、零改代码。**
+
+**机制**：
+- 未设 `allow_admin_from` → 全员 `unrestricted`（所有命令，默认态）。
+- 设了 `allow_admin_from` → 名单内 = **admin**（全命令，含 `/restart` 远程重启，改完源码不用上服务器）；其余 = **user**（仅 `user_allowed_commands` + floor）。
+- **floor = 仅 `help`、`whoami`**（写死在 `_ALWAYS_ALLOWED_FOR_USERS`，非配置）。⚠️ `/new` 不在 floor，必须显式写进 `user_allowed_commands`。
+- 企业微信是 1:1 私聊 = **DM scope**，用 `allow_admin_from` / `user_allowed_commands`（群聊才用 `group_` 前缀那对）。
+- 用户 ID 用企业微信实际下发的（owner_key `wecom:corp:app:<user_id>` 里那段）；管理员发 `/whoami` 回显里的 `User ID` 即是。
+
+**配置位置**：`~/.hermes-dev/config.yaml` 新增顶层 `platforms.wecom.extra`（凭证仍走 .env 的 `WECOM_BOT_ID/SECRET`，此处只加命令权限键）：
+```yaml
+platforms:
+  wecom:
+    enabled: true
+    extra:
+      allow_admin_from:
+        - "HanYuWen"          # 管理员 user_id，可多个；全命令(含 /restart)
+      user_allowed_commands:  # 普通用户可用（canonical 名，不带斜杠）
+        - new
+        - reset               # /new 与 /reset 同处，两个都放保险
+        - stop
+        - status
+        - usage
+        - title
+        - sessions
+        - resume
+        - retry
+        - compress
+        - undo
+        - memory
+```
+
+**改后**：重启网关；管理员/普通账号各发 `/whoami` 验证（管理员 = admin/all；普通 = 那些 + help/whoami）。可用 `python -c` 干跑 `gateway.slash_access.policy_from_extra(extra,"dm").can_run(user_id, cmd)` 预校验。改前已备份 `config.yaml.bak.<ts>`。
+
 ## 坑 1：企业微信依赖跨两个 extra，只装 `[wecom]` 不够
 
 **现象**：启动报
