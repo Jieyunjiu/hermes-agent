@@ -19,3 +19,10 @@ def test_manifest_preinstalled_libraries():
     # 禁止列出未装库
     assert "pymupdf" not in m
     assert "fitz" not in m
+
+
+def test_manifest_missing_capability_fail_fast():
+    """缺能力时指示模型快速失败并告知用户联系 IT 管理员，而非无限重试。"""
+    m = build_capability_manifest()
+    assert "IT 管理员" in m
+    assert "do NOT" in m  # 明确禁止重复重试/安装

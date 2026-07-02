@@ -1905,4 +1905,8 @@ def build_capability_manifest() -> str:
         "- Pre-installed libraries (use these; do NOT pip install — no network): Python — "
         "pandas, numpy, openpyxl, python-docx, python-pptx, reportlab, matplotlib, "
         "pdfplumber, PyPDF2, Pillow; plus LibreOffice (headless), Python 3.11, Node.js 20.\n"
+        "- If a task needs a library or capability that is NOT in the list above, do NOT "
+        "try to install it and do NOT retry repeatedly. Stop and reply to the user in "
+        "Chinese, naming the missing capability, e.g.: "
+        "「当前任务需要 <具体能力/库>，本沙箱暂不具备，请联系 IT 管理员开通。」\n"
     )
