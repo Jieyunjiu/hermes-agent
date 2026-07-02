@@ -7,8 +7,33 @@
 
 ```bash
 source .venv/bin/activate                 # 改造版固定用项目内 .venv
+git checkout self-native-sandbox           # 全原生沙箱方案在此分支（不在 self）
 HERMES_HOME=~/.hermes-dev hermes gateway   # 用 dev 目录隔离，不碰 ~/.hermes
 ```
+
+## 本分支 self-native-sandbox 配置增量（全原生数据处理沙箱化）
+
+> 相对上一版（受限工具 + Option A）的差异。**企业微信接入完全不用改**（gateway/回调/owner_key 解析未碰）。
+
+**这次的本质变化**：file 工具 **和** execute_code 现在都**在 owner docker 容器里执行**（上一版 file 是宿主进程内）；terminal 已在容器里；vision_analyze 进了工具集；skills 来源锁死为 operator 只读。工具集收敛为 13 个：
+`read_file write_file patch search_files terminal execute_code skills_list skill_view vision_analyze memory session_search todo clarify`（不含 process/read_terminal/web/skill_manage）。
+
+**沿用上一版、确认还在即可（已核对✅）**：
+- `security.multi_tenant.enabled: true`、`workspace_root: ~/.hermes-dev/workspace`（可写）
+- `security.multi_tenant.sandbox.{enabled: true, image: hermes-sandbox:latest, cpus, memory_mb, max_concurrent}`
+- `default_reset_policy.mode: none`
+- 依赖 `aiohttp` + `defusedxml`（见坑 1）
+- 镜像 `hermes-sandbox:latest` 已 build（file/execute_code/terminal 三者现在都在它里面跑，数据库 pandas/pdfplumber/python-docx 等对三者都生效）
+
+**这次新增/要注意的**：
+1. **vision provider（当前是 `auto`，非本地模型）**：vision_analyze 现在在工具集里。要"本地视觉模型省成本+不外泄"，需把 `auxiliary.vision`（provider/base_url/model）指向**内网端点**。
+   - 本地还没部署本地视觉模型时：Opus 4.8 多模态 + `agent.image_input_mode: auto` → 图片走**主模型原生看图**，图片任务正常；但模型若主动调 `vision_analyze` 工具，`provider=auto` 可能路由到外部（与不外泄冲突）且无 api_key 多半失败。**部署本地视觉模型后务必改指向内网**。
+2. **skills 只认 `HERMES_HOME/skills`**：多租户下 `skills.external_dirs` 与 plugin skill **被忽略/拒绝**。公司技能放 `~/.hermes-dev/skills`（已在✅）。
+3. execute_code 沙箱内回调工具用的是 **file-based RPC over docker exec**，禁网下也能工作，无需挂 socket/额外配置。
+
+**代码里已钉死、无需配置**：`--network=none`、`docker_persist_across_processes=false`（退出即回收）、`mount_credentials=false`、`mount_cache=false`、`mount_skills=true`（`build_owner_sandbox_overrides`）。
+
+**实测重点**：上传→execute_code 跑 pdfplumber→write_file 出 word，三者同容器同 `/workspace` 接力；A/B 双 owner 互相看不到文件；容器内 `pip install` 外网失败（禁网生效）。
 
 ## 坑 1：企业微信依赖跨两个 extra，只装 `[wecom]` 不够
 
