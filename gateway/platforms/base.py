@@ -4503,6 +4503,10 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # 局部导入，与本文件里 _map_workspace_delivery_path_to_owner_root 的
+        # 现有写法保持一致（避免给整个模块增加顶层 gateway.multi_tenant 依赖）。
+        from gateway.multi_tenant import scoped_owner_key
+
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -4593,7 +4597,16 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                # 根因2 修复：_handle_message_with_agent 的 owner_key ContextVar
+                # 绑定范围只覆盖它自身（finally 里已经 _clear_session_env 清空），
+                # 但这里的路径换算发生在它返回之后——同一个 asyncio task，所以
+                # 用 scoped_owner_key 从 event.source 重新短暂绑定一次，退出时
+                # 自动恢复原值，不影响后续逻辑。event.source.owner_key 为空时
+                # （单用户模式，或多租户下确实取不到）传 ""，
+                # _map_workspace_delivery_path_to_owner_root 内部该 fail-closed
+                # 的地方仍然 fail-closed，不放宽任何隔离保证。
+                with scoped_owner_key(event.source.owner_key or ""):
+                    media_files = self.filter_media_delivery_paths(media_files)
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -4612,7 +4625,9 @@ class BasePlatformAdapter(ABC):
                     # system/command notices so config paths stay visible text
                     # instead of becoming native uploads.
                     local_files, text_content = self.extract_local_files(text_content)
-                    local_files = self.filter_local_delivery_paths(local_files)
+                    # 同上（根因2）：这里同样在 owner_key 已被清空后才换算路径。
+                    with scoped_owner_key(event.source.owner_key or ""):
+                        local_files = self.filter_local_delivery_paths(local_files)
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 

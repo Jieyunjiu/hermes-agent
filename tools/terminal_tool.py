@@ -65,6 +65,7 @@ from gateway.multi_tenant import (
     sandbox_enabled,
     sandbox_config,
     get_current_owner_key,
+    current_owner_key_or_none,
 )
 
 # 并发信号量：限制同时执行的 docker 命令数，容量来自 sandbox_config().max_concurrent（默认 24）
@@ -2448,6 +2449,12 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
+                            # 根因1 修复：owner_key 不在 HERMES_SESSION_* contextvar
+                            # 里（它是 gateway.multi_tenant 单独维护的 ContextVar），
+                            # 这里显式采集一次，随 watcher 元数据一起持久化，供
+                            # 完成通知重新注入 turn 时恢复绑定。用 or_none 版本，
+                            # 不 fail-closed——单用户模式下就是普通的 ""。
+                            proc_session.watcher_owner_key = current_owner_key_or_none() or ""
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -2485,6 +2492,7 @@ def terminal_tool(
                             "user_name": proc_session.watcher_user_name,
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
+                            "owner_key": proc_session.watcher_owner_key,
                             "notify_on_complete": True,
                         })
 

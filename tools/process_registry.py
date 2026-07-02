@@ -114,6 +114,7 @@ class ProcessSession:
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
+    watcher_owner_key: str = ""                 # 多租户 owner_key（可选字段，旧 checkpoint 没有，默认 ""）
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
     # Watch patterns — trigger agent notification when output matches any pattern
@@ -297,6 +298,7 @@ class ProcessRegistry:
                     "user_name": session.watcher_user_name,
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
+                    "owner_key": session.watcher_owner_key,
                     "message": (
                         f"Watch patterns disabled for process {session.id} — "
                         f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -330,6 +332,7 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
+            "owner_key": session.watcher_owner_key,
         })
 
     def _global_watch_admit(self, now: float) -> bool:
@@ -1661,6 +1664,7 @@ class ProcessRegistry:
                             "watcher_user_name": s.watcher_user_name,
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_message_id": s.watcher_message_id,
+                            "watcher_owner_key": s.watcher_owner_key,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
@@ -1739,6 +1743,10 @@ class ProcessRegistry:
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
                 watcher_message_id=entry.get("watcher_message_id", ""),
+                # 向后兼容：旧 checkpoint 文件没有这个字段，get 默认 "" ——
+                # 下游 _build_process_event_source 在多租户模式下识别到空
+                # owner_key 会拒绝重新注入该合成回合，不会用空 owner 放行。
+                watcher_owner_key=entry.get("watcher_owner_key", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
@@ -1760,6 +1768,7 @@ class ProcessRegistry:
                     "user_name": session.watcher_user_name,
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
+                    "owner_key": session.watcher_owner_key,
                     "notify_on_complete": session.notify_on_complete,
                 })
 

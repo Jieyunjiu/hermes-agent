@@ -13188,6 +13188,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
+        # 根因1 修复：只有走到这个手写 fallback 分支（session_store / 内存缓存
+        # 都没命中）才需要从 evt 里读 owner_key —— 上面两条早返回路径
+        # （entry.origin / _get_cached_session_source）本来就带着完整 owner_key。
+        # evt["owner_key"] 由 watcher 元数据（terminal_tool.py 采集，process_registry
+        # 崩溃恢复 checkpoint 回填）传入；旧 checkpoint 没有这个字段时是 ""。
+        owner_key = str(evt.get("owner_key") or "").strip() or None
+
+        from gateway.multi_tenant import multi_tenant_enabled
+        if multi_tenant_enabled() and not owner_key:
+            # fail-closed：绝不能让这条合成消息带着空 owner_key 重新走一遍
+            # _handle_message_with_agent —— 那会让 turn 内 memory_tool 等所有
+            # get_current_owner_key() 调用点在多租户模式下直接 fail-closed
+            # 报 OwnerKeyMissing 崩掉，而不是这里优雅地丢弃通知。
+            logger.warning(
+                "Dropping synthetic process event for session %s: multi-tenant "
+                "mode is enabled but no owner_key could be resolved for this "
+                "background-process watcher (missing spawn-time capture, or a "
+                "pre-upgrade checkpoint) — refusing to reinject the turn in an "
+                "unowned context",
+                session_key or evt.get("session_id", "unknown"),
+            )
+            return None
+
         return SessionSource(
             platform=platform,
             chat_id=chat_id,
@@ -13195,6 +13218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            owner_key=owner_key,
         )
 
     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
@@ -13328,6 +13352,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id = watcher.get("user_id", "")
         user_name = watcher.get("user_name", "")
         message_id = str(watcher.get("message_id") or "").strip() or None
+        # 根因1 修复：watcher 字典里可能带着 spawn 时采集的 owner_key
+        # （terminal_tool.py notify_on_complete 场景），或崩溃恢复 checkpoint
+        # 里的 watcher_owner_key（可能是旧 checkpoint，取不到就是 ""）。
+        owner_key = watcher.get("owner_key", "")
         agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
 
@@ -13397,6 +13425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "thread_id": thread_id,
                         "user_id": user_id,
                         "user_name": user_name,
+                        "owner_key": owner_key,
                     })
                     if not source:
                         logger.warning(
