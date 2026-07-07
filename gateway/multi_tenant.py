@@ -383,6 +383,9 @@ def build_owner_sandbox_overrides(owner_key: str) -> dict:
         "mount_credentials": False,               # 全局凭证绝不进容器
         "mount_skills": True,                      # 公共业务 skills（RO）保留
         "mount_cache": False,                      # 全局 cache 含他人上传，关
+        "docker_run_as_host_user": True,           # 以宿主 uid 运行：容器产出文件归宿主用户，
+                                                   # 否则 root 所有 → 宿主投递/用户本地都打不开
+
         "container_cpu": int(sb.get("cpus", 2)),
         "container_memory": int(sb.get("memory_mb", 4096)),
     }

@@ -648,6 +648,16 @@ class TestMediaExtensionAllowlistParity:
         assert "/tmp/report.md" not in stripped
         assert "Here is your report:" in stripped
 
+    def test_source_code_extension_is_deliverable(self):
+        """源码/脚本类扩展名（.py 等）在白名单里，MEDIA: 标签会被识别并从正文剥离，
+        而不是原样当文本显示（沙箱里助手常产出 .py 脚本要发回用户）。"""
+        from gateway.platforms.base import MEDIA_DELIVERY_EXTS, MEDIA_TAG_CLEANUP_RE
+        assert ".py" in MEDIA_DELIVERY_EXTS
+        text = "脚本给你: MEDIA:/workspace/numpymldemo.py"
+        stripped = MEDIA_TAG_CLEANUP_RE.sub("", text).strip()
+        assert "MEDIA:" not in stripped
+        assert "numpymldemo.py" not in stripped
+
 
 class TestMediaDeliveryPathValidation:
     def _patch_roots(self, monkeypatch, *roots):

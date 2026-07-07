@@ -1272,7 +1272,12 @@ def apply_owner_override(env_type: str, config: dict, overrides: dict) -> "tuple
         "mount_skills": overrides.get("mount_skills", config.get("mount_skills", True)),
         "mount_cache": overrides.get("mount_cache", config.get("mount_cache", True)),
         "docker_forward_env": config.get("docker_forward_env", []),
-        "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        # owner 沙箱把它钉死为 True（容器产出文件归宿主用户，否则 root 所有发不出去），
+        # 所以这里必须让 override 能覆盖全局 config。
+        "docker_run_as_host_user": overrides.get(
+            "docker_run_as_host_user",
+            config.get("docker_run_as_host_user", False),
+        ),
         # 以下四个键此前遗漏，导致 file / execute_code 走本 helper 时
         # container_config 与 terminal 工具的内联 dict（execute_command 内）
         # 不一致：
@@ -2126,7 +2131,12 @@ def terminal_tool(
                                                                                config.get("docker_mount_cwd_to_workspace", False)),
                                 "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_env": config.get("docker_env", {}),
-                                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+                                # owner 沙箱钉死为 True（见 build_owner_sandbox_overrides），
+                                # override 优先，与 apply_owner_override 保持一致。
+                                "docker_run_as_host_user": overrides.get(
+                                    "docker_run_as_host_user",
+                                    config.get("docker_run_as_host_user", False),
+                                ),
                                 "docker_extra_args": config.get("docker_extra_args", []),
                                 "docker_persist_across_processes": overrides.get("docker_persist_across_processes",
                                                                                  config.get("docker_persist_across_processes", True)),

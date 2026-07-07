@@ -22,8 +22,19 @@ def test_build_owner_sandbox_overrides_shape(tmp_path):
     assert ov["mount_credentials"] is False
     assert ov["mount_skills"] is True
     assert ov["mount_cache"] is False
+    assert ov["docker_run_as_host_user"] is True   # 容器以宿主 uid 运行，产出文件归宿主用户
     assert ov["container_cpu"] == 2
     assert ov["container_memory"] == 4096
+
+
+def test_apply_owner_override_propagates_run_as_host_user():
+    """owner override 里的 docker_run_as_host_user=True 必须透传到 container_config，
+    否则容器仍以 root 起，产出文件宿主投递/用户本地都打不开。"""
+    from tools.terminal_tool import apply_owner_override
+    overrides = {"env_type": "docker", "docker_run_as_host_user": True}
+    # 全局 config 默认 False，override 必须能覆盖它
+    _env, cc, _host_cwd = apply_owner_override("local", {}, overrides)
+    assert cc["docker_run_as_host_user"] is True
 
 
 def test_build_owner_sandbox_overrides_creates_workspace_dir(tmp_path):
